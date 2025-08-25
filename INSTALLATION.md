@@ -1,4 +1,4 @@
-# Installation Guide - AortaCFD-Snappy
+# Installation Guide - AortaCFD-Mesh
 
 ## Quick Installation
 
@@ -17,10 +17,24 @@ sudo apt-get install python3 python3-pip python3-dev
 source /opt/openfoam12/etc/bashrc
 ```
 
-### 2. Install AortaCFD-Snappy
+### 2. Install AortaCFD-Mesh
+
+#### Method A: Virtual Environment Setup (Recommended)
 ```bash
-git clone https://github.com/YourUsername/AortaCFD-Snappy.git
-cd AortaCFD-Snappy
+git clone https://github.com/YourUsername/AortaCFD-Mesh.git
+cd AortaCFD-Mesh
+
+# Automated setup
+./setup_venv.sh
+
+# Daily usage
+source activate.sh
+```
+
+#### Method B: System Installation
+```bash
+git clone https://github.com/YourUsername/AortaCFD-Mesh.git
+cd AortaCFD-Mesh
 pip install -r requirements.txt
 ```
 
@@ -59,7 +73,49 @@ ls tutorial/patient1/             # Should show: inlet.stl, outlet*.stl, wall_ao
 - **Storage**: 5 GB free space for temporary files
 - **Processors**: Multi-core recommended for large meshes
 
+## Virtual Environment Setup
+
+### Manual Virtual Environment Setup
+```bash
+# Create virtual environment
+python3 -m venv venv
+
+# Activate virtual environment
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Source OpenFOAM
+source /opt/openfoam12/etc/bashrc
+
+# Test installation
+python -m mesh_optim --help
+
+# Deactivate when done
+deactivate
+```
+
+### Virtual Environment Benefits
+- **Isolation**: No conflicts with system Python packages
+- **Reproducibility**: Exact package versions across different machines
+- **Clean uninstall**: Just delete the `venv` directory
+- **Multiple projects**: Different environments for different projects
+
 ## Troubleshooting
+
+### Virtual Environment Issues
+```bash
+# If venv creation fails
+sudo apt-get install python3-venv python3-pip
+
+# If setup_venv.sh permission denied
+chmod +x setup_venv.sh
+
+# If activate.sh doesn't work
+source venv/bin/activate
+source /opt/openfoam12/etc/bashrc
+```
 
 ### OpenFOAM Issues
 ```bash
@@ -74,10 +130,14 @@ foam                             # Should start OpenFOAM shell
 
 ### Python Issues
 ```bash
-# If import errors
-pip install --upgrade numpy scipy
+# If "No module named 'psutil'" error
+source venv/bin/activate          # Activate venv first
+pip install -r requirements.txt
 
-# If permission errors
+# If import errors
+pip install --upgrade numpy scipy psutil
+
+# If permission errors (system install)
 pip install --user -r requirements.txt
 ```
 
@@ -94,8 +154,8 @@ chmod -R 755 output/
 
 For development and testing:
 ```bash
-git clone https://github.com/YourUsername/AortaCFD-Snappy.git
-cd AortaCFD-Snappy
+git clone https://github.com/YourUsername/AortaCFD-Mesh.git
+cd AortaCFD-Mesh
 pip install -e .                 # Editable install
 pip install -r requirements.txt
 
@@ -122,6 +182,6 @@ After installation:
 
 ## Support
 
-- **Installation Issues**: [GitHub Issues](https://github.com/YourUsername/AortaCFD-Snappy/issues)
+- **Installation Issues**: [GitHub Issues](https://github.com/YourUsername/AortaCFD-Mesh/issues)
 - **OpenFOAM Help**: [OpenFOAM Documentation](https://doc.openfoam.org/)
 - **Python Help**: [Python Package Installation](https://packaging.python.org/tutorials/installing-packages/)
