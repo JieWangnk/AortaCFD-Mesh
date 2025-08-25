@@ -5,8 +5,8 @@
   
   "mesh": {
     "base_size_mode": "diameter",
-    "cells_per_diameter": 22,
-    "min_cells_per_throat": 28
+    "cells_per_diameter": 15,
+    "min_cells_per_throat": 10
   },
   "SCALING": {
     "scale_m": 0.1
@@ -61,7 +61,7 @@
   
   "advanced": {
     "BLOCKMESH": {
-      "resolution": 100,
+      "min_per_axis": [12, 12, 12],
       "grading": [1, 1, 1]
     },
     

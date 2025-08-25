@@ -251,7 +251,19 @@ Constraint failures: Coverage 66.3% < target 70.0%; Thickness 48.8% below target
 ---
 
 ## 📝 Configuration Files Explained
+⚠️ Geometry Scaling: Why SCALING Matters
+Important:
+The configuration parameter:
+```
+"SCALING": {
+    "scale_m": 0.1
+}
+```
+is critical for identifying the correct geometry scale. Setting scale_m ensures that STL files are interpreted in the correct units (e.g., millimeters vs meters). This directly affects:
 
+- Layer addition and growth: Proper scaling is required for accurate boundary layer thickness and growth, which impacts y+ calculations and mesh quality.
+- CFD boundary conditions: Physical parameters (velocity, viscosity, etc.) depend on the correct geometry scale for realistic simulation results.
+- Wall function accuracy: y+ and layer coverage calculations rely on the mesh being scaled to match the physical vessel size.
 ### stage1_simplified.json - Essential Parameters Only
 
 The simplified config contains only the most important parameters for typical use:
@@ -477,6 +489,19 @@ Both stages use unified, literature-backed acceptance criteria:
 ---
 
 ## 🚀 Quick Start Examples (Stage 1)
+## 🚀 Quick Start Examples (Stage 1)
+
+### Tutorial Datasets
+
+**Tutorial 1** (`tutorial/0014_H_AO_COA/`): From SimVascular Vascular Model Repository
+- **Species**: Human
+- **Anatomy**: Aorta  
+- **Disease**: Coarctation of Aorta
+- **Procedure**: End-to-End Anastomosis
+- **Legacy Name**: 0102_0001 (Model added: 27 Dec 2021)
+- **Preprocessing**: STL files extracted using Blender
+
+**Tutorial 2**: From internal project (additional test case)
 
 ### Aortic Coarctation (Large Vessel)
 ```bash
@@ -642,10 +667,10 @@ If you use AortaCFD-Snappy in your research, please cite:
 
 ```bibtex
 @software{aortacfd_snappy,
-  title={AortaCFD-Snappy: Two-Stage Mesh Optimization for Cardiovascular CFD},
+  title={AortaCFD-Mesh: Two-Stage Mesh Optimization for Cardiovascular CFD},
   author={[Jie Wang]},
   year={2025},
-  url={https://github.com/JieWangnk/AortaCFD-Snappy}
+  url={https://github.com/JieWangnk/AortaCFD-Mesh}
 }
 ```
 
