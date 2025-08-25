@@ -1,0 +1,94 @@
+{
+  "case_info": {
+    "patient_id": "patient1",
+    "description": "Complex aortic geometry with multiple branches",
+    "imaging_modality": "CT",
+    "case_type": "multi_branch_aorta"
+  },
+  "simulation_settings": {
+    "analysis_type": "standard",
+    "mesh_quality": "auto",
+    "solver_type": "laminar",
+    "time_discretization": "adaptive",
+    "max_iterations": 1000,
+    "convergence_criteria": {
+      "velocity": 1e-6,
+      "pressure": 1e-7
+    }
+  },
+  "physics": {
+    "blood_density": 1060,
+    "blood_viscosity": 0.004,
+    "cardiac_cycle_period": 0.8,
+    "heart_rate_bpm": 75
+  },
+  "geometry": {
+    "refinement_level": "coarse",
+    "rotation": true,
+    "target_normal": [0, 0, 1],
+    "scale_factor": 0.001
+  },
+  "mesh": {
+    "BLOCKMESH_SETTINGS": {
+      "resolution": 40
+    },
+    "SNAPPY_SETTINGS": {
+      "parallel": false,
+      "surfaceRefinementLevels": [1, 2],
+      "featureLevel": 2
+    }
+  },
+  "boundary_conditions": {
+    "inlet": {
+      "type": "TIMEVARYING",
+      "csv_file": "BPM75.csv",
+      "data_type": "velocity",
+      "profile": "womersley",
+      "orientation": "out"
+    },
+    "outlets": {
+      "type": "3EWINDKESSEL",
+      "windkessel_settings": {
+        "systolic_pressure": 120,
+        "diastolic_pressure": 80,
+        "methodology": "murray_law_automatic"
+      }
+    },
+    "walls": {
+      "type": "no_slip",
+      "roughness": 0.0
+    }
+  },
+  "simulation_control": {
+    "number_of_cycles": 1,
+    "end_time": 0.8,
+    "target_runtime_minutes": 60,
+    "writeInterval": 0.01
+  },
+  "numerical_settings": {
+    "time_stepping": "adaptive",
+    "initial_deltaT": 1e-3,
+    "maxCo": 1.0,
+    "maxDeltaT": 1e-2,
+    "solver_tolerance": "balanced"
+  },
+  "output_settings": {
+    "save_frequency": 10,
+    "variables": ["velocity", "pressure", "wall_shear_stress"],
+    "post_processing": {
+      "generate_report": true,
+      "create_animations": false,
+      "export_vtk": true
+    }
+  },
+  "computational": {
+    "parallel": false,
+    "max_processors": "auto",
+    "memory_limit_gb": "auto",
+    "mesh_refinement": {
+      "automatic": true,
+      "target_cell_size": "auto",
+      "boundary_layers": true
+    }
+  }
+}
