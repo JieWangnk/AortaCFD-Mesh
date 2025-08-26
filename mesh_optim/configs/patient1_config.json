@@ -1,0 +1,89 @@
+{
+  "description": "Optimized config for patient1 case - fine scale multi-branch aorta, scale 0.001m (1mm units)",
+  
+  "openfoam_env_path": "source /opt/openfoam12/etc/bashrc",
+  
+  "mesh": {
+    "base_size_mode": "diameter",
+    "cells_per_diameter": 8,
+    "min_cells_per_throat": 4
+  },
+  "SCALING": {
+    "scale_m": 0.001
+  },
+
+  "refinement": {
+    "surface_levels": [1, 1],
+    "near_band_dx": 6,
+    "far_band_dx": 12,
+    "feature_angle": {
+      "init": 35,
+      "step": 10
+    }
+  },
+  
+  "layers": {
+    "n": 6,
+    "expansion": 1.3,
+    "first_layer": {
+      "t_over_dx": 0.6,
+      "t1_min_frac": 0.05,
+      "t1_max_frac": 0.3
+    }
+  },
+  
+  "physics": {
+    "solver_mode": "RANS",
+    "flow_model": "laminar",
+    "y_plus": 1,
+    "U_peak": 0.5,
+    "rho": 1060.0,
+    "mu": 0.004,
+    "use_womersley_bands": true,
+    "heart_rate_hz": 1.25
+  },
+  
+  "accept": {
+    "maxNonOrtho": 75,
+    "maxSkewness": 4.5,
+    "min_layer_coverage": 0.50
+  },
+  
+  "compute": {
+    "procs": 4,
+    "cell_budget_kb_per_cell": 1.5
+  },
+  
+  "iterations": {
+    "max": 5,
+    "ladder": [[1,1], [1,1], [1,1], [1,2], [1,2]]
+  },
+  
+  "advanced": {
+    "BLOCKMESH": {
+      "resolution": 200,
+      "grading": [1, 1, 1]
+    },
+    
+    "SNAPPY": {
+      "maxLocalCells": 1500000,
+      "maxGlobalCells": 6000000,
+      "nCellsBetweenLevels": 2,
+      "resolveFeatureAngle": 50,
+      "nSmoothPatch": 5,
+      "nFeatureSnapIter": 12,
+      "implicitFeatureSnap": true,
+      "explicitFeatureSnap": false
+    },
+    
+    "LAYERS": {
+      "nSurfaceLayers": 6,
+      "minThickness_abs": 1.0e-8,
+      "expansionRatio": 1.3,
+      "nGrow": 2,
+      "featureAngle": 70,
+      "maxThicknessToMedialRatio": 0.2,
+      "minMedianAxisAngle": 95
+    }
+  }
+}
