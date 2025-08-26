@@ -1,4 +1,4 @@
-# AortaCFD-Snappy: Automated Mesh Optimization for Cardiovascular CFD
+# AortaCFD-Mesh: Automated Mesh Optimization for Cardiovascular CFD
 
 **Stage 1: Geometry-aware mesh optimization for testing and introduction**
 
@@ -10,7 +10,7 @@
 
 ## 🎯 Overview
 
-AortaCFD-Snappy provides automated mesh optimization for cardiovascular CFD simulations across **all vascular beds**. This release focuses on **Stage 1**: geometry-aware mesh generation for testing and introduction purposes. The system automatically derives mesh parameters from actual vessel dimensions and generates high-quality meshes with proper boundary layers.
+AortaCFD-Mesh provides automated mesh optimization for cardiovascular CFD simulations across **all vascular beds**. This release focuses on **Stage 1**: geometry-aware mesh generation for testing and introduction purposes. The system automatically derives mesh parameters from actual vessel dimensions and generates high-quality meshes with proper boundary layers.
 
 **Stage 2** (physics-verified meshing with y+ calculations, Richardson extrapolation, and Grid Convergence Index analysis) **will be introduced later** for production CFD workflows.
 
@@ -44,8 +44,8 @@ sudo apt-get install openfoam12   # Ubuntu/Debian
 # or download from https://openfoam.org/download/
 
 # 2. Clone repository
-git clone https://github.com/[username]/AortaCFD-Snappy.git
-cd AortaCFD-Snappy
+git clone https://github.com/[username]/AortaCFD-Mesh.git
+cd AortaCFD-Mesh
 
 # 3. Install Python dependencies
 pip install numpy psutil
@@ -663,7 +663,7 @@ Areas for contribution:
 
 ## 📚 Citation
 
-If you use AortaCFD-Snappy in your research, please cite:
+If you use AortaCFD-Mesh in your research, please cite:
 
 ```bibtex
 @software{aortacfd_snappy,
@@ -682,4 +682,4 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
-**AortaCFD-Snappy v2.0** - Literature-backed mesh optimization for cardiovascular CFD
+**AortaCFD-Mesh v2.0** - Literature-backed mesh optimization for cardiovascular CFD

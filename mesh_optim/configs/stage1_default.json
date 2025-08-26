@@ -5,8 +5,8 @@
   
   "mesh": {
     "base_size_mode": "diameter",
-    "cells_per_diameter": 15,
-    "min_cells_per_throat": 10
+    "cells_per_diameter": 10,
+    "min_cells_per_throat": 5
   },
   "SCALING": {
     "scale_m": 0.1
@@ -26,9 +26,9 @@
     "n": 10,
     "expansion": 1.2,
     "first_layer": {
-      "t_over_dx": 0.8,
+      "t_over_dx": 0.5,
       "t1_min_frac": 0.02,
-      "t1_max_frac": 0.1
+      "t1_max_frac": 0.2
     }
   },
   
@@ -61,7 +61,7 @@
   
   "advanced": {
     "BLOCKMESH": {
-      "min_per_axis": [12, 12, 12],
+      "resolution": 150,
       "grading": [1, 1, 1]
     },
     
