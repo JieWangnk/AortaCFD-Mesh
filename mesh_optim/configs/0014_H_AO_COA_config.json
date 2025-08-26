@@ -1,5 +1,5 @@
 {
-  "description": "Optimized config for 0014_H_AO_COA case - large complex aorta with coarctation, scale 0.1m",
+  "description": "Optimized config for 0014_H_AO_COA case - large complex aorta with coarctation, scale 0.1m. Features adaptive band scaling and automatic relative sizing for stable layer coverage.",
   
   "openfoam_env_path": "source /opt/openfoam12/etc/bashrc",
   
@@ -14,8 +14,8 @@
 
   "refinement": {
     "surface_levels": [1, 2],
-    "near_band_dx": 3,
-    "far_band_dx": 8,
+    "near_band_dx": 7,
+    "far_band_dx": 14,
     "feature_angle": {
       "init": 25,
       "step": 15
@@ -56,7 +56,9 @@
   
   "iterations": {
     "max": 4,
-    "ladder": [[1,2], [1,2], [2,2], [1,3]]
+    "ladder": [[1,2], [1,2], [2,2], [1,3]],
+    "use_robust_optimization": true,
+    "use_coverage_gated_progression": true
   },
   
   "advanced": {
