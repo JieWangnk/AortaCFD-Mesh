@@ -10,6 +10,7 @@ import csv
 import math
 import re
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
@@ -18,7 +19,21 @@ from .constants import (
     MAX_ITERATIONS_DEFAULT,
     MICRO_TRIALS_PER_ITERATION,
     COVERAGE_ACCEPTABLE_THRESHOLD,
-    SOLVER_MODES
+    SOLVER_MODES,
+    THICKNESS_FRACTION_SEVERE_THRESHOLD,
+    THICKNESS_FRACTION_THIN_THRESHOLD,
+    FIRST_LAYER_MIN_THICKNESS,
+    FIRST_LAYER_REDUCTION_FACTOR,
+    EXPANSION_RATIO_MIN,
+    EXPANSION_RATIO_SMALL_REDUCTION,
+    EXPANSION_RATIO_MEDIUM_REDUCTION,
+    LAYER_ITER_CONSERVATIVE_INCREASE,
+    RELAXED_ITER_CONSERVATIVE_INCREASE,
+    RELATIVE_SIZING_FIRST_LAYER,
+    RELATIVE_SIZING_FINAL_LAYER,
+    MAX_THICKNESS_TO_CELL_RATIO,
+    THICKNESS_RATIO_SAFETY,
+    COVERAGE_THRESHOLD_MICRO_OPTIMIZATION
 )
 from .geometry_handler import GeometryHandler
 from .openfoam_dicts import OpenFOAMDictGenerator  
@@ -32,6 +47,7 @@ from .legacy_functions import (
     log_surface_histogram,
     evaluate_stage1_metrics
 )
+from .utils import safe_float, safe_int, safe_bool, get_openfoam_geometry_dir
 
 
 @dataclass
@@ -91,6 +107,7 @@ class Stage1MeshOptimizer:
         self.stage1 = _safe_get(self.config, ["STAGE1"], {}) or {}
         self.current_iteration = 0
         self.max_iterations = int(self.stage1.get("max_iterations", self.config.get("max_iterations", MAX_ITERATIONS_DEFAULT)))
+        
         
         # Surface refinement levels
         self.surface_levels = list(_safe_get(self.config, ["SNAPPY", "surface_level"], [1, 1]))
@@ -176,6 +193,9 @@ class Stage1MeshOptimizer:
             self.config["max_iterations"] = iterations.get("max", 3)
             if "ladder" in iterations:
                 self.config["STAGE1"]["ladder"] = iterations["ladder"]
+            
+            # Map micro_layer_retries to STAGE1 section
+            self.config["STAGE1"]["micro_layer_retries"] = iterations.get("micro_layer_retries", 3)
             
             # Map physics parameters  
             physics = self.config.get("physics", {})
@@ -542,65 +562,49 @@ class Stage1MeshOptimizer:
         dx = float(dx)
         dx_surf = dx / (2 ** max_level)
 
-        # Pull current knobs with safe type conversion
-        def safe_float(val, default=0.0):
-            try:
-                return float(val) if val is not None else default
-            except (ValueError, TypeError):
-                return default
-        
-        def safe_int(val, default=0):
-            try:
-                return int(val) if val is not None else default
-            except (ValueError, TypeError):
-                return default
-        
-        def safe_bool(val, default=False):
-            if isinstance(val, bool):
-                return val
-            if isinstance(val, str):
-                return val.lower() in ('true', '1', 'yes', 'on')
-            return bool(val) if val is not None else default
-        
+        # Pull current knobs with safe type conversion from utils
         ER = safe_float(L.get("expansionRatio", 1.2))
         N = safe_int(L.get("nSurfaceLayers", 5))
         rel_mode = safe_bool(L.get("relativeSizes", False))
 
         # --- Rescue branch based on thickness ratio (0..1)
         if thickness_frac is not None:
-            if thickness_frac < 0.15:  # abandoned/early prune
-                # Prefer thinner first layer + gentler ER
+            if thickness_frac < THICKNESS_FRACTION_SEVERE_THRESHOLD:  # Only for extremely poor coverage
+                # Conservative first layer reduction + gentler ER
                 if not rel_mode:
                     t1 = safe_float(L.get("firstLayerThickness_abs", 50e-6))
-                    new_t1 = max(5e-6, 0.80 * t1)
+                    new_t1 = max(FIRST_LAYER_MIN_THICKNESS, FIRST_LAYER_REDUCTION_FACTOR * t1)
                     L["firstLayerThickness_abs"] = new_t1
-                    self.logger.info(f"[micro] Early prune: t1 {t1*1e6:.1f}→{new_t1*1e6:.1f} μm")
-                # lower ER a touch
-                new_ER = max(1.12, ER - 0.03)
+                    self.logger.info(f"[micro] Severe prune: t1 {t1*1e6:.1f}→{new_t1*1e6:.1f} μm")
+                # Smaller ER reduction
+                new_ER = max(EXPANSION_RATIO_MIN, ER - EXPANSION_RATIO_MEDIUM_REDUCTION)
                 if new_ER < ER:
                     L["expansionRatio"] = new_ER
-                    self.logger.info(f"[micro] Early prune: ER {ER:.3f}→{new_ER:.3f}")
-                # switch to relative sizes automatically on refined surfaces
-                if max_level > 1 and not rel_mode:
+                    self.logger.info(f"[micro] Severe prune: ER {ER:.3f}→{new_ER:.3f}")
+                # Only switch to relative sizes on highly refined surfaces with very poor coverage
+                if max_level > 2 and not rel_mode and thickness_frac < 0.05:
                     L["relativeSizes"] = True
-                    L["firstLayerThickness"] = 0.20
-                    L["finalLayerThickness"] = 0.70
-                    self.logger.info("[micro] Early prune: switch to relativeSizes (t1_rel=0.20, T_rel=0.70)")
-            elif thickness_frac < 0.60:  # thin but present
-                new_ER = max(1.12, ER - 0.02)
+                    L["firstLayerThickness"] = RELATIVE_SIZING_FIRST_LAYER
+                    L["finalLayerThickness"] = RELATIVE_SIZING_FINAL_LAYER
+                    self.logger.info(f"[micro] Severe prune on refined surface: switch to relativeSizes (t1_rel={RELATIVE_SIZING_FIRST_LAYER}, T_rel={RELATIVE_SIZING_FINAL_LAYER})")
+            elif thickness_frac < THICKNESS_FRACTION_THIN_THRESHOLD:
+                new_ER = max(EXPANSION_RATIO_MIN, ER - EXPANSION_RATIO_SMALL_REDUCTION)
                 if new_ER < ER:
                     L["expansionRatio"] = new_ER
                     self.logger.info(f"[micro] Thin layers: ER {ER:.3f}→{new_ER:.3f}")
-                L["nLayerIter"]   = max(safe_int(L.get("nLayerIter", 50)), 70)
-                L["nRelaxedIter"] = max(safe_int(L.get("nRelaxedIter", 20)), 25)
+                # More conservative iteration increases
+                current_layer_iter = safe_int(L.get("nLayerIter", 50))
+                current_relaxed_iter = safe_int(L.get("nRelaxedIter", 20))
+                L["nLayerIter"] = max(current_layer_iter, current_layer_iter + LAYER_ITER_CONSERVATIVE_INCREASE)
+                L["nRelaxedIter"] = max(current_relaxed_iter, current_relaxed_iter + RELAXED_ITER_CONSERVATIVE_INCREASE)
                 self.logger.info(f"[micro] Thin layers: nLayerIter={L['nLayerIter']}, nRelaxedIter={L['nRelaxedIter']}")
 
-        # --- Cap total thickness relative to surface Δx: T/Δx ≤ 0.9
+        # --- Cap total thickness relative to surface Δx: T/Δx ≤ MAX_THICKNESS_TO_CELL_RATIO
         # Relative mode: T_rel is already T/Δx_surf
         if rel_mode:
             T_rel = safe_float(L.get("finalLayerThickness", 0.75))
-            if T_rel > 0.90:
-                new_T_rel = 0.85
+            if T_rel > MAX_THICKNESS_TO_CELL_RATIO:
+                new_T_rel = THICKNESS_RATIO_SAFETY
                 L["finalLayerThickness"] = new_T_rel
                 self.logger.info(f"[micro] Cap T/Δx (relative): {T_rel:.3f}→{new_T_rel:.3f}")
         else:
@@ -609,7 +613,7 @@ class Stage1MeshOptimizer:
             series = (ER**N - 1.0) / max(ER - 1.0, 1e-12) if ER > 1.0 else N
             T_abs = t1 * series
             T_over_dx = T_abs / max(dx_surf, 1e-12)
-            if T_over_dx > 0.90:
+            if T_over_dx > MAX_THICKNESS_TO_CELL_RATIO:
                 # Prefer reducing N by one (keeps t1 intent), recompute series
                 new_N = max(3, N - 1)
                 new_series = (ER**new_N - 1.0) / max(ER - 1.0, 1e-12) if ER > 1.0 else new_N
@@ -626,12 +630,21 @@ class Stage1MeshOptimizer:
     def iterate_until_quality(self):
         """Main optimization loop - coordinates all modules to achieve quality mesh."""
         self.logger.info("Starting Stage‑1 geometry‑aware optimization")
-
-        best_iter = None
-        best_cell_count = math.inf
-        previous_coverage_data = None
         
-        # Initialize summary CSV
+        optimization_state = self._initialize_optimization()
+        
+        # Main iteration loop
+        for k in range(1, self.max_iterations + 1):
+            iteration_result = self._run_single_iteration(k, optimization_state)
+            optimization_state = self._update_optimization_state(optimization_state, k, iteration_result)
+            
+            if iteration_result.get('early_termination'):
+                break
+        
+        return self._finalize_optimization(optimization_state)
+    
+    def _initialize_optimization(self) -> Dict:
+        """Initialize optimization state and create summary CSV."""
         summary_path = self.output_dir / "stage1_summary.csv"
         if not summary_path.exists():
             with open(summary_path, "w", newline="") as f:
@@ -640,251 +653,345 @@ class Stage1MeshOptimizer:
                     "levels_min","levels_max","resolveFeatureAngle","nLayers","firstLayer","minThickness",
                     "thicknessPct","N_eff","diag"   # NEW columns for layer diagnostics
                 ])
-
-        # Main iteration loop
-        for k in range(1, self.max_iterations + 1):
-            self.current_iteration = k
-            self.optimizer.update_current_iteration(k)
-            self.logger.info(f"=== ITERATION {k} ===")
+        
+        return {
+            'best_iter': None,
+            'best_cell_count': math.inf,
+            'previous_coverage_data': None,
+            'summary_path': summary_path
+        }
+    
+    def _run_single_iteration(self, k: int, optimization_state: Dict) -> Dict:
+        """Run a single optimization iteration."""
+        self.current_iteration = k
+        self.optimizer.update_current_iteration(k)
+        self.logger.info(f"=== ITERATION {k} ===")
+        
+        # Setup iteration environment
+        iter_dir = self._setup_iteration_directory(k)
+        
+        # Prepare geometry and mesh parameters
+        geometry_params = self._prepare_geometry_parameters(iter_dir)
+        
+        # Generate mesh dictionaries
+        self._generate_mesh_dictionaries(iter_dir, geometry_params)
+        
+        # Run mesh generation with micro-trials
+        mesh_result = self._run_mesh_generation_trials(iter_dir, geometry_params)
+        
+        # Evaluate and log results
+        return self._evaluate_iteration_results(k, iter_dir, mesh_result, optimization_state)
+    
+    def _setup_iteration_directory(self, k: int) -> Path:
+        """Setup directory structure for iteration."""
+        # Log configuration for transparency  
+        snap = self.config["SNAPPY"]
+        self.logger.debug(f"Config: maxGlobal={snap['maxGlobalCells']:,}, "
+                         f"maxLocal={snap['maxLocalCells']:,}, "
+                         f"featureAngle={snap.get('resolveFeatureAngle', 45)}°")
+        
+        # Setup iteration directory
+        iter_dir = self.output_dir / f"iter_{k:03d}"
+        iter_dir.mkdir(exist_ok=True)
+        (iter_dir / "system").mkdir(exist_ok=True)
+        (iter_dir / "logs").mkdir(exist_ok=True)
+        
+        return iter_dir
+    
+    def _prepare_geometry_parameters(self, iter_dir: Path) -> Dict:
+        """Prepare all geometry-related parameters for mesh generation."""
+        # 1) Copy/scale STL files and get outlet names
+        outlet_names = self.geometry_handler.copy_and_scale_stl_files(iter_dir)
+        
+        # 2) Compute bounding box and reference diameters from scaled STL files
+        geometry_dir = get_openfoam_geometry_dir()
+        stl_map_norm = {
+            "inlet": iter_dir/f"constant/{geometry_dir}/inlet.stl",
+            self.geometry_handler.wall_name: iter_dir/f"constant/{geometry_dir}/{self.geometry_handler.wall_name}.stl",
+            **{p.stem: iter_dir/f"constant/{geometry_dir}/{p.stem}.stl" 
+               for p in self.geometry_handler.stl_files["outlets"]}
+        }
+        
+        # Generate bounding box using physics mesh generator
+        gen = PhysicsAwareMeshGenerator()
+        bbox_data = gen.compute_stl_bounding_box(stl_map_norm, skip_scaling=True)
+        
+        # Estimate diameters and derive base cell size
+        geometry_path = iter_dir / "constant" / geometry_dir
+        D_ref, D_min = self.geometry_handler.estimate_reference_diameters(stl_root=geometry_path)
+        dx = self.geometry_handler.derive_base_cell_size(D_ref, D_min)
+        
+        # 3) Apply adaptive feature angle
+        adaptive_angle = self.geometry_handler.adaptive_feature_angle(
+            D_ref, D_min, len(outlet_names), iter_dir=iter_dir)
+        self.config["SNAPPY"]["resolveFeatureAngle"] = adaptive_angle
+        
+        # 5) Apply ladder progression and coverage gating  
+        surface_levels = self._apply_surface_level_progression()
+        
+        # 6) Calculate internal seed point from scaled STL files
+        internal_point = self.geometry_handler.calculate_seed_point(
+            bbox_data, {"inlet": geometry_path / "inlet.stl"}, dx_base=dx)
+        
+        # 7) Apply dynamic feature snap iterations
+        self._configure_dynamic_feature_snapping()
+        
+        return {
+            'outlet_names': outlet_names,
+            'bbox_data': bbox_data,
+            'dx': dx,
+            'surface_levels': surface_levels,
+            'internal_point': internal_point,
+            'geometry_dir': geometry_path
+        }
+    
+    def _apply_surface_level_progression(self) -> List[int]:
+        """Apply ladder progression and coverage gating."""
+        ladder = self.stage1.get("ladder", [[1,1],[2,2],[2,3]])
+        idx = min(self.current_iteration-1, len(ladder)-1)
+        proposed_surface_levels = list(ladder[idx])
+        
+        if self.stage1.get("use_coverage_gated_progression", True):
+            actual_surface_levels, progression_allowed = self.optimizer.check_coverage_gated_progression(
+                proposed_surface_levels, getattr(self, '_previous_coverage_data', None))
+        else:
+            actual_surface_levels, progression_allowed = proposed_surface_levels, True
+        
+        # Update surface levels and inform modules
+        surface_levels_changed = (not hasattr(self, 'surface_levels') or 
+                                self.surface_levels != actual_surface_levels)
+        self.surface_levels = actual_surface_levels
+        self.optimizer.update_surface_levels(actual_surface_levels)
+        self.dict_generator.update_surface_levels(actual_surface_levels)
+        
+        self.logger.info(f"Surface levels from ladder: {proposed_surface_levels} → {self.surface_levels}")
+        if not progression_allowed:
+            self.logger.info("   (progression blocked by coverage gating)")
+        
+        return actual_surface_levels
+    
+    def _configure_dynamic_feature_snapping(self):
+        """Configure dynamic feature snap iterations based on feature angle."""
+        from .constants import (
+            FEATURE_ANGLE_LOW_THRESHOLD, FEATURE_ANGLE_HIGH_THRESHOLD,
+            FEATURE_SNAP_ITER_LOW_ANGLE, FEATURE_SNAP_ITER_HIGH_ANGLE
+        )
+        
+        current_feature_angle = int(self.config["SNAPPY"].get("resolveFeatureAngle", 45))
+        if current_feature_angle <= FEATURE_ANGLE_LOW_THRESHOLD:
+            current_nFeatureSnapIter = FEATURE_SNAP_ITER_LOW_ANGLE
+        elif current_feature_angle >= FEATURE_ANGLE_HIGH_THRESHOLD:
+            current_nFeatureSnapIter = FEATURE_SNAP_ITER_HIGH_ANGLE
+        else:
+            # Linear interpolation
+            current_nFeatureSnapIter = int(FEATURE_SNAP_ITER_LOW_ANGLE + 
+                (FEATURE_SNAP_ITER_HIGH_ANGLE - FEATURE_SNAP_ITER_LOW_ANGLE) * 
+                (current_feature_angle - FEATURE_ANGLE_LOW_THRESHOLD) / 
+                (FEATURE_ANGLE_HIGH_THRESHOLD - FEATURE_ANGLE_LOW_THRESHOLD))
+        
+        self.config["SNAPPY"]["nFeatureSnapIter"] = current_nFeatureSnapIter
+        self.logger.info(f"Dynamic nFeatureSnapIter: {current_nFeatureSnapIter} "
+                       f"(for resolveFeatureAngle={current_feature_angle}°)")
+    
+    def _generate_mesh_dictionaries(self, iter_dir: Path, geometry_params: Dict):
+        """Generate all required OpenFOAM dictionaries."""
+        # Generate block mesh dictionary
+        self.dict_generator.generate_blockmesh_dict(
+            iter_dir, geometry_params['bbox_data'], geometry_params['dx'])
+        
+        # Generate surface features dictionary
+        surface_list = [f"{self.geometry_handler.wall_name}.stl", "inlet.stl"] + \
+                      [f"{n}.stl" for n in geometry_params['outlet_names']]
+        self.dict_generator.generate_surface_features_dict(iter_dir, surface_list)
+        
+        # Generate snappy dictionaries
+        self.dict_generator.generate_snappy_dict(
+            iter_dir, geometry_params['outlet_names'], 
+            geometry_params['internal_point'], geometry_params['dx'], "no_layers")
+        self.dict_generator.generate_snappy_dict(
+            iter_dir, geometry_params['outlet_names'], 
+            geometry_params['internal_point'], geometry_params['dx'], "layers")
+        
+        # Create .foam file for visualization
+        self.dict_generator.create_foam_file(iter_dir)
+    
+    def _run_mesh_generation_trials(self, iter_dir: Path, geometry_params: Dict) -> Dict:
+        """Run mesh generation with micro-trials and return best result."""
+        K = int(self.stage1.get("micro_layer_retries", MICRO_TRIALS_PER_ITERATION))
+        best_local = None
+        
+        for trial in range(1, K+1):
+            self.logger.info(f"Micro-trial {trial}/{K} for iteration {self.current_iteration}")
             
-            # Log configuration for transparency  
-            snap = self.config["SNAPPY"]
-            self.logger.debug(f"Config: maxGlobal={snap['maxGlobalCells']:,}, "
-                             f"maxLocal={snap['maxLocalCells']:,}, "
-                             f"featureAngle={snap.get('resolveFeatureAngle', 45)}°")
+            # Run mesh generation with clean baseline for each micro-trial
+            snap_m, layer_m, layer_cov = self.optimizer.run_mesh_generation(
+                iter_dir, force_full_remesh=True, trial_num=trial)
             
-            # Setup iteration directory
-            iter_dir = self.output_dir / f"iter_{k:03d}"
-            iter_dir.mkdir(exist_ok=True)
-            (iter_dir / "system").mkdir(exist_ok=True)
-            (iter_dir / "logs").mkdir(exist_ok=True)
-
-            # 1) Copy/scale STL files and get outlet names
-            outlet_names = self.geometry_handler.copy_and_scale_stl_files(iter_dir)
-            
-            # 2) Compute bounding box and reference diameters from scaled STL files
-            stl_map_norm = {
-                "inlet": iter_dir/"constant/triSurface/inlet.stl",
-                self.geometry_handler.wall_name: iter_dir/f"constant/triSurface/{self.geometry_handler.wall_name}.stl",
-                **{p.stem: iter_dir/f"constant/triSurface/{p.stem}.stl" 
-                   for p in self.geometry_handler.stl_files["outlets"]}
-            }
-            
-            # Generate bounding box using physics mesh generator
-            gen = PhysicsAwareMeshGenerator()
-            bbox_data = gen.compute_stl_bounding_box(stl_map_norm, skip_scaling=True)
-            
-            # Estimate diameters and derive base cell size
-            tri_dir = iter_dir / "constant" / "triSurface"
-            D_ref, D_min = self.geometry_handler.estimate_reference_diameters(stl_root=tri_dir)
-            dx = self.geometry_handler.derive_base_cell_size(D_ref, D_min)
-            
-            # 3) Apply adaptive feature angle
-            adaptive_angle = self.geometry_handler.adaptive_feature_angle(
-                D_ref, D_min, len(outlet_names), iter_dir=iter_dir)
-            self.config["SNAPPY"]["resolveFeatureAngle"] = adaptive_angle
-            
-            # 4) Generate OpenFOAM dictionaries
-            self.dict_generator.generate_blockmesh_dict(iter_dir, bbox_data, dx)
-            
-            # Generate surface features dictionary
-            surface_list = [f"{self.geometry_handler.wall_name}.stl", "inlet.stl"] + \
-                          [f"{n}.stl" for n in outlet_names]
-            self.dict_generator.generate_surface_features_dict(iter_dir, surface_list)
-            
-            # 5) Apply ladder progression and coverage gating
-            ladder = self.stage1.get("ladder", [[1,1],[2,2],[2,3]])
-            idx = min(self.current_iteration-1, len(ladder)-1)
-            proposed_surface_levels = list(ladder[idx])
-            
-            if self.stage1.get("use_coverage_gated_progression", True):
-                actual_surface_levels, progression_allowed = self.optimizer.check_coverage_gated_progression(
-                    proposed_surface_levels, previous_coverage_data)
-            else:
-                actual_surface_levels, progression_allowed = proposed_surface_levels, True
-            
-            # Update surface levels and inform modules
-            surface_levels_changed = (not hasattr(self, 'surface_levels') or 
-                                    self.surface_levels != actual_surface_levels)
-            self.surface_levels = actual_surface_levels
-            self.optimizer.update_surface_levels(actual_surface_levels)
-            self.dict_generator.update_surface_levels(actual_surface_levels)
-            
-            self.logger.info(f"Surface levels from ladder: {proposed_surface_levels} → {self.surface_levels}")
-            if not progression_allowed:
-                self.logger.info("   (progression blocked by coverage gating)")
-
-            # 6) Calculate internal seed point from scaled STL files
-            internal_point = self.geometry_handler.calculate_seed_point(
-                bbox_data, {"inlet": tri_dir / "inlet.stl"}, dx_base=dx)
-            
-            # 7) Apply dynamic feature snap iterations
-            from .constants import (
-                FEATURE_ANGLE_LOW_THRESHOLD, FEATURE_ANGLE_HIGH_THRESHOLD,
-                FEATURE_SNAP_ITER_LOW_ANGLE, FEATURE_SNAP_ITER_HIGH_ANGLE
-            )
-            
-            current_feature_angle = int(self.config["SNAPPY"].get("resolveFeatureAngle", 45))
-            if current_feature_angle <= FEATURE_ANGLE_LOW_THRESHOLD:
-                current_nFeatureSnapIter = FEATURE_SNAP_ITER_LOW_ANGLE
-            elif current_feature_angle >= FEATURE_ANGLE_HIGH_THRESHOLD:
-                current_nFeatureSnapIter = FEATURE_SNAP_ITER_HIGH_ANGLE
-            else:
-                # Linear interpolation
-                current_nFeatureSnapIter = int(FEATURE_SNAP_ITER_LOW_ANGLE + 
-                    (FEATURE_SNAP_ITER_HIGH_ANGLE - FEATURE_SNAP_ITER_LOW_ANGLE) * 
-                    (current_feature_angle - FEATURE_ANGLE_LOW_THRESHOLD) / 
-                    (FEATURE_ANGLE_HIGH_THRESHOLD - FEATURE_ANGLE_LOW_THRESHOLD))
-            
-            self.config["SNAPPY"]["nFeatureSnapIter"] = current_nFeatureSnapIter
-            self.logger.info(f"Dynamic nFeatureSnapIter: {current_nFeatureSnapIter} "
-                           f"(for resolveFeatureAngle={current_feature_angle}°)")
-
-            # 8) Generate snappy dictionaries
-            self.dict_generator.generate_snappy_dict(iter_dir, outlet_names, internal_point, dx, "no_layers")
-            self.dict_generator.generate_snappy_dict(iter_dir, outlet_names, internal_point, dx, "layers")
-            
-            # Create .foam file for visualization
-            self.dict_generator.create_foam_file(iter_dir)
-
-            # 9) Run mesh generation with micro-loop optimization
-            K = MICRO_TRIALS_PER_ITERATION
-            best_local = None
-            
-            for trial in range(1, K+1):
-                self.logger.info(f"Micro-trial {trial}/{K} for iteration {k}")
+            # Handle mesh generation failure with graceful fallback
+            if not snap_m.get('meshOK', False) or 'error' in snap_m:
+                self.logger.warning(f"Mesh generation failed at iteration {self.current_iteration}, trial {trial}")
+                self.logger.warning(f"Error: {snap_m.get('error', 'Unknown error')}")
                 
-                # Run mesh generation
-                snap_m, layer_m, layer_cov = self.optimizer.run_mesh_generation(
-                    iter_dir, force_full_remesh=(trial == 1 and surface_levels_changed))
-                
-                # Check for critical mesh generation failure
-                if not snap_m.get('meshOK', False) or 'error' in snap_m:
-                    self.logger.error(f"CRITICAL: Mesh generation failed at iteration {k}, trial {trial}")
-                    self.logger.error(f"Error: {snap_m.get('error', 'Unknown error')}")
-                    self.logger.error("Stopping optimization due to mesh generation failure")
-                    # Write summary indicating failure
+                if best_local is not None:
+                    best_coverage = best_local[2].get('coverage_overall', 0.0)
+                    self.logger.info(f"Falling back to best result so far: {best_coverage*100:.1f}% coverage")
+                    self.logger.info("Treating micro-trials as exploratory - accepting best achieved result")
+                    break  # Exit trial loop but continue with best result
+                else:
+                    # No previous result - this is first trial failure
+                    self.logger.error(f"CRITICAL: First trial failed at iteration {self.current_iteration}")
                     with open(self.output_dir / "OPTIMIZATION_FAILED.txt", "w") as f:
-                        f.write(f"Optimization failed at iteration {k}, trial {trial}\n")
+                        f.write(f"First trial failed at iteration {self.current_iteration}\n")
                         f.write(f"Error: {snap_m.get('error', 'Unknown error')}\n")
                         f.write("Check iter_XXX/logs/ for detailed error information\n")
-                    return None  # Exit optimization
-                
-                # Check if micro-retry is needed for poor layer coverage
-                coverage = layer_cov.get('coverage_overall', 0.0)
-                min_threshold = max(0.55, self.optimizer.targets.min_layer_cov - 0.10)
-                
-                if coverage < min_threshold:
-                    self.logger.info("Low coverage detected, attempting micro-layer optimization")
-                    micro_metrics, micro_cov = self.optimizer.run_micro_layer_optimization(
-                        iter_dir, outlet_names, internal_point, dx, layer_cov)
-                    
-                    if micro_metrics and micro_cov:
-                        layer_cov = micro_cov
-                        layer_m.update(micro_metrics)
-                        self.logger.info("Micro-loop applied: using improved layers-only outcome")
-                
-                # Evaluate trial quality
-                constraints_ok, failure_reasons = self.optimizer.meets_quality_constraints(snap_m, layer_m, layer_cov)
-                coverage = layer_cov.get('coverage_overall', 0.0)
-                
-                # Track best trial by coverage and provide enhanced diagnostics
-                if best_local is None or coverage > best_local[2].get('coverage_overall', 0):
-                    best_local = (snap_m, layer_m, layer_cov)
-                    
-                    # Enhanced diagnostics
-                    diag_result = self._diagnose_layer_result(layer_cov)
-                    effective_layers = diag_result.get("effective_layers", 0.0)
-                    diagnosis = diag_result.get("diagnosis", "unknown")
-                    
-                    self.logger.info(f"Trial {trial}: thickness={coverage*100:.1f}% (N_eff={effective_layers:.2f}, {diagnosis}) - NEW BEST")
-                else:
-                    self.logger.info(f"Trial {trial}: coverage={coverage*100:.1f}% (not better)")
-                
-                # Stop if we have good quality or acceptable coverage
-                if constraints_ok or coverage >= COVERAGE_ACCEPTABLE_THRESHOLD:
-                    self.logger.info(f"Stopping micro-loop: "
-                                   f"{'constraints OK' if constraints_ok else f'coverage ≥{COVERAGE_ACCEPTABLE_THRESHOLD*100:.0f}%'}")
-                    break
-                
-                # Apply parameter adaptations for next trial
-                if trial < K:
-                    self.logger.info(f"Applying adaptations for trial {trial+1}")
-                    self.optimizer.apply_parameter_adaptations(coverage, trial, K)
-
-            # Use the best trial results
-            snap_m, layer_m, layer_cov = best_local
+                    return {'error': 'First trial failed', 'early_termination': True}
             
-            # Enhanced final reporting
-            diag_result = self._diagnose_layer_result(layer_cov)
-            thickness_frac = diag_result.get("thickness_fraction", 0.0)
-            effective_layers = diag_result.get("effective_layers", 0.0)
-            diagnosis = diag_result.get("diagnosis", "unknown")
+            # Check if micro-retry is needed for poor layer coverage  
+            coverage = layer_cov.get('coverage_overall', 0.0)
+            min_threshold = max(0.55, self.optimizer.targets.min_layer_cov - 0.02)
             
-            self.logger.info(f"Selected best trial: thickness={thickness_frac*100:.1f}% (N_eff={effective_layers:.2f}, {diagnosis})")
-            
-            # Log recommendations if layers are problematic
-            if diagnosis in ["not-added-or-abandoned-early", "thin-but-present (added-then-pruned)", "barely-one-layer"]:
-                recommendations = diag_result.get("recommendation", [])
-                self.logger.info(f"Layer improvement suggestions: {'; '.join(recommendations[:3])}")  # Show top 3
-            
-            # 10) Log surface histogram for analysis
-            if hasattr(self, 'surface_levels'):
-                t1_thickness = self.config["LAYERS"].get("firstLayerThickness_abs", 50e-6)
-                n_layers = self.config["LAYERS"].get("nSurfaceLayers", 6)
-                expansion = self.config["LAYERS"].get("expansionRatio", 1.2)
-                total_thickness = (t1_thickness * (expansion**n_layers - 1) / (expansion - 1) 
-                                 if expansion != 1.0 else t1_thickness * n_layers)
+            if coverage < min_threshold:
+                self.logger.info("Low coverage detected, attempting micro-layer optimization")
+                micro_metrics, micro_cov = self.optimizer.run_micro_layer_optimization(
+                    iter_dir, geometry_params['outlet_names'], 
+                    geometry_params['internal_point'], geometry_params['dx'], layer_cov)
                 
-                log_surface_histogram(iter_dir, self.surface_levels, dx, 
-                                    t1_thickness, total_thickness, self.logger)
+                if micro_metrics and micro_cov:
+                    layer_cov = micro_cov
+                    layer_m.update(micro_metrics)
+                    self.logger.info("Micro-loop applied: using improved layers-only outcome")
             
-            # NEW: Write layer diagnostics and get thickness fraction for reactive tuning
-            thickness_frac, n_eff, diag = self._write_layer_diag(iter_dir, layer_cov.get('iteration_data'))
-            self.logger.info(f"Layer diagnosis: {diag}")
-            
-            # Update coverage data for next iteration's gating
-            previous_coverage_data = layer_cov
-            
-            # 11) Evaluate iteration and log results
+            # Evaluate trial quality and track best
             constraints_ok, failure_reasons = self.optimizer.meets_quality_constraints(snap_m, layer_m, layer_cov)
-            cell_count = self.optimizer.get_cell_count(layer_m, snap_m)
+            coverage = layer_cov.get('coverage_overall', 0.0)
             
-            # Log iteration summary with diagnostic data
-            self.optimizer.log_iteration_summary(summary_path, k, cell_count, snap_m, layer_m, layer_cov,
-                                                thickness_frac=thickness_frac, n_eff=n_eff, diag=diag)
+            if best_local is None or coverage > best_local[2].get('coverage_overall', 0):
+                best_local = (snap_m, layer_m, layer_cov)
+                
+                diag_result = self._diagnose_layer_result(layer_cov)
+                effective_layers = diag_result.get("effective_layers", 0.0)
+                diagnosis = diag_result.get("diagnosis", "unknown")
+                
+                self.logger.info(f"Trial {trial}: thickness={coverage*100:.1f}% (N_eff={effective_layers:.2f}, {diagnosis}) - NEW BEST")
+            else:
+                self.logger.info(f"Trial {trial}: coverage={coverage*100:.1f}% (not better)")
             
-            # Track best iteration
-            if constraints_ok and cell_count < best_cell_count:
-                best_iter = k
-                best_cell_count = cell_count
-                self.logger.info(f"New best iteration: {k} with {cell_count:,} cells")
+            # Stop if we have good quality or reach target coverage
+            if constraints_ok or coverage >= self.optimizer.targets.min_layer_cov:
+                self.logger.info(f"Stopping micro-loop: "
+                               f"{'constraints OK' if constraints_ok else f'coverage ≥{self.optimizer.targets.min_layer_cov*100:.0f}%'}")
+                break
             
-            # Log iteration results with enhanced diagnostics
-            diag_result = self._diagnose_layer_result(layer_cov)
-            thickness_frac = diag_result.get("thickness_fraction", 0.0)
-            effective_layers = diag_result.get("effective_layers", 0.0)
-            diagnosis = diag_result.get("diagnosis", "unknown")
+            # Apply parameter adaptations for next trial
+            if trial < K:
+                self.logger.info(f"Applying adaptations for trial {trial+1}")
+                self.optimizer.apply_parameter_adaptations(coverage, trial, K)
+        
+        return {
+            'mesh_data': best_local,
+            'error': None,
+            'early_termination': False
+        }
+    
+    def _evaluate_iteration_results(self, k: int, iter_dir: Path, mesh_result: Dict, optimization_state: Dict) -> Dict:
+        """Evaluate iteration results and prepare for next iteration."""
+        if mesh_result.get('error'):
+            return {'early_termination': True}
+        
+        snap_m, layer_m, layer_cov = mesh_result['mesh_data']
+        
+        # Enhanced final reporting
+        diag_result = self._diagnose_layer_result(layer_cov)
+        thickness_frac = diag_result.get("thickness_fraction", 0.0)
+        effective_layers = diag_result.get("effective_layers", 0.0)
+        diagnosis = diag_result.get("diagnosis", "unknown")
+        
+        self.logger.info(f"Selected best trial: thickness={thickness_frac*100:.1f}% (N_eff={effective_layers:.2f}, {diagnosis})")
+        
+        # Log recommendations for problematic layers
+        if diagnosis in ["not-added-or-abandoned-early", "thin-but-present (added-then-pruned)", "barely-one-layer"]:
+            recommendations = diag_result.get("recommendation", [])
+            self.logger.info(f"Layer improvement suggestions: {'; '.join(recommendations[:3])}")
+        
+        # Log surface histogram and diagnostics
+        self._log_iteration_diagnostics(iter_dir, layer_cov)
+        
+        # Evaluate constraints and cell count
+        constraints_ok, failure_reasons = self.optimizer.meets_quality_constraints(snap_m, layer_m, layer_cov)
+        cell_count = self.optimizer.get_cell_count(layer_m, snap_m)
+        
+        # Log iteration summary with diagnostic data
+        thickness_frac, n_eff, diag = self._write_layer_diag(iter_dir, layer_cov.get('iteration_data'))
+        self.optimizer.log_iteration_summary(
+            optimization_state['summary_path'], k, cell_count, snap_m, layer_m, layer_cov,
+            thickness_frac=thickness_frac, n_eff=n_eff, diag=diag)
+        
+        # Apply micro-reactive tuning for next iteration
+        if k < self.max_iterations:
+            dx = optimization_state.get('dx', 0.001)  # fallback value
+            self._apply_micro_reactive_tuning(dx, thickness_frac, n_eff)
+        
+        return {
+            'constraints_ok': constraints_ok,
+            'cell_count': cell_count,
+            'layer_coverage': layer_cov,
+            'failure_reasons': failure_reasons,
+            'early_termination': False
+        }
+    
+    def _log_iteration_diagnostics(self, iter_dir: Path, layer_cov: Dict):
+        """Log surface histogram and other diagnostic information."""
+        if hasattr(self, 'surface_levels'):
+            t1_thickness = self.config["LAYERS"].get("firstLayerThickness_abs", 50e-6)
+            n_layers = self.config["LAYERS"].get("nSurfaceLayers", 6)
+            expansion = self.config["LAYERS"].get("expansionRatio", 1.2)
+            total_thickness = (t1_thickness * (expansion**n_layers - 1) / (expansion - 1) 
+                             if expansion != 1.0 else t1_thickness * n_layers)
             
-            self.logger.info(f"Iteration {k} complete: {cell_count:,} cells, "
-                           f"thickness={thickness_frac*100:.1f}% (N_eff={effective_layers:.2f}, {diagnosis}), "
-                           f"{'PASS' if constraints_ok else 'FAIL'}")
-            
-            if failure_reasons:
-                for reason in failure_reasons:
-                    self.logger.info(f"  - {reason}")
-            
-            # NEW: Apply micro-reactive tuning for the next iteration
-            if k < self.max_iterations:  # Only apply if there's a next iteration
-                self._apply_micro_reactive_tuning(dx, thickness_frac, n_eff)
-
-        # Final evaluation and export best mesh
+            log_surface_histogram(iter_dir, self.surface_levels, 0.001,  # default dx fallback
+                                t1_thickness, total_thickness, self.logger)
+    
+    def _update_optimization_state(self, state: Dict, k: int, iteration_result: Dict) -> Dict:
+        """Update optimization state after each iteration."""
+        if iteration_result.get('early_termination'):
+            return state
+        
+        # Track best iteration
+        if (iteration_result['constraints_ok'] and 
+            iteration_result['cell_count'] < state['best_cell_count']):
+            state['best_iter'] = k
+            state['best_cell_count'] = iteration_result['cell_count']
+            self.logger.info(f"New best iteration: {k} with {iteration_result['cell_count']:,} cells")
+        
+        # Update coverage data for next iteration's gating
+        state['previous_coverage_data'] = iteration_result['layer_coverage']
+        self._previous_coverage_data = iteration_result['layer_coverage']  # Store for _apply_surface_level_progression
+        
+        # Log iteration results
+        diag_result = self._diagnose_layer_result(iteration_result['layer_coverage'])
+        thickness_frac = diag_result.get("thickness_fraction", 0.0)
+        effective_layers = diag_result.get("effective_layers", 0.0)
+        diagnosis = diag_result.get("diagnosis", "unknown")
+        
+        self.logger.info(f"Iteration {k} complete: {iteration_result['cell_count']:,} cells, "
+                       f"thickness={thickness_frac*100:.1f}% (N_eff={effective_layers:.2f}, {diagnosis}), "
+                       f"{'PASS' if iteration_result['constraints_ok'] else 'FAIL'}")
+        
+        if iteration_result['failure_reasons']:
+            for reason in iteration_result['failure_reasons']:
+                self.logger.info(f"  - {reason}")
+        
+        return state
+    
+    def _finalize_optimization(self, optimization_state: Dict):
+        """Export best mesh and finalize optimization."""
+        best_iter = optimization_state['best_iter']
+        
         if best_iter:
             best_dir = self.output_dir / f"iter_{best_iter:03d}"
             export_dir = self.output_dir / "best"
             
             if export_dir.exists():
-                import shutil
                 shutil.rmtree(export_dir)
             shutil.copytree(best_dir, export_dir)
             
@@ -899,3 +1006,5 @@ class Stage1MeshOptimizer:
             self.logger.warning("No iteration met quality constraints")
         
         self.logger.info("Stage‑1 optimization complete")
+        return best_iter
+

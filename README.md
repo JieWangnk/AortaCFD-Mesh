@@ -513,20 +513,20 @@ python -m mesh_optim stage1 --geometry tutorial/patient1/
 # 💡 Status: System correctly prioritizes mesh quality over layer count
 ```
 
-### Why 47.4% Coverage is Actually Good Engineering
-The system demonstrates **smart constraint handling**:
+### Realistic Layer Coverage Expectations (Updated Aug 2025)
+Based on cardiovascular CFD research and practical experience:
 
-1. **Quality vs Coverage Trade-off**: 
-   - 47.4% coverage with good quality > 70% coverage with poor quality
-   - Prevents solver divergence from highly skewed cells
+**🎯 Typical Coverage Targets:**
+- **Simple Geometries**: 80-90% (straight tubes, simple bifurcations)
+- **Complex Aortas**: 70-80% (with good quality parameters)
+- **Tortuous Vessels**: 60-70% (physics-limited due to curvature)
+- **Previous Result**: 47.4% was below optimal expectations
 
-2. **Geometric Complexity**: 
-   - Complex aorta geometry naturally limits layer growth
-   - System reached the physical limits of the geometry
-
-3. **Convergence Behavior**:
-   - Iterations 1-4: Consistently achieved 47.4% (converged to optimal)
-   - Parameter space exhausted (tried thickness 50μm → 10μm)
+**⚡ Recent Improvements (Production Stability):**
+- **Micro-Trial Stability**: Disabled multi-trial loops that caused mesh inconsistencies
+- **Enhanced Configurations**: Added patient1_config_improved.json targeting 70-80% coverage
+- **Refined Parameters**: Better expansion ratios (1.13-1.14), surface levels [1,2]
+- **Quality Balance**: maxSkewness 5.0, better layer smoothing parameters
 
 ### Optimization Analysis
 ```
@@ -729,7 +729,10 @@ Recent testing with `tutorial/patient1/` demonstrates the system working correct
 3. **Smart Convergence**: Reaches geometry-limited optimum (47.4%) across iterations
 4. **Proper Trade-offs**: Prioritizes mesh quality over layer count (good engineering)
 
-The 47.4% coverage result is **expected and appropriate** for complex cardiovascular geometries. Higher coverage would require compromising mesh quality, leading to solver convergence issues.
+**Current Status**: Production stability improvements deployed (August 2025):
+- Single-trial optimization prevents refinement consistency errors
+- Enhanced configurations target 70-80% coverage with quality balance
+- System now suitable for production CFD workflows with realistic expectations
 
 ---
 

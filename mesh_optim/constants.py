@@ -52,7 +52,7 @@ DEFAULT_MIN_LAYER_COVERAGE = 0.65
 
 # Iteration control
 MAX_ITERATIONS_DEFAULT = 4
-MICRO_TRIALS_PER_ITERATION = 3  # Number of layer parameter trials
+MICRO_TRIALS_PER_ITERATION = 3  # Number of layer parameter trials with preserved logs
 
 # Coverage convergence criteria
 COVERAGE_PLATEAU_THRESHOLD = 0.005  # 0.5% change threshold
@@ -175,3 +175,74 @@ SOLVER_MODES = {
         "min_layer_coverage": MIN_LAYER_COVERAGE_LAMINAR
     }
 }
+
+# ============================================================================
+# MICRO-REACTIVE TUNING CONSTANTS  
+# ============================================================================
+
+# Layer thickness tuning thresholds
+THICKNESS_FRACTION_SEVERE_THRESHOLD = 0.10    # Extremely poor coverage threshold
+THICKNESS_FRACTION_THIN_THRESHOLD = 0.40      # Thin but present threshold  
+THICKNESS_FRACTION_GOOD_THRESHOLD = 0.60      # Good coverage threshold
+
+# First layer thickness bounds
+FIRST_LAYER_MIN_THICKNESS = 5e-6              # 5 micrometers minimum
+FIRST_LAYER_REDUCTION_FACTOR = 0.90            # Conservative reduction: 90% instead of 80%
+
+# Expansion ratio bounds and adjustments
+EXPANSION_RATIO_MIN = 1.15                     # Minimum expansion ratio
+EXPANSION_RATIO_SMALL_REDUCTION = 0.01         # Small reduction step
+EXPANSION_RATIO_MEDIUM_REDUCTION = 0.02        # Medium reduction step
+
+# Iteration count adjustments
+LAYER_ITER_CONSERVATIVE_INCREASE = 10          # Conservative iteration increase
+RELAXED_ITER_CONSERVATIVE_INCREASE = 3         # Conservative relaxed iteration increase
+
+# Relative sizing thresholds
+RELATIVE_SIZING_FIRST_LAYER = 0.25             # 25% of local cell size (conservative)
+RELATIVE_SIZING_FINAL_LAYER = 0.75             # 75% of local cell size (conservative)
+
+# Thickness ratio limits
+MAX_THICKNESS_TO_CELL_RATIO = 0.90             # Maximum T/Δx ratio  
+THICKNESS_RATIO_SAFETY = 0.85                  # Safety ratio when capping
+
+# Coverage thresholds for interventions
+COVERAGE_THRESHOLD_MICRO_OPTIMIZATION = 0.55   # Threshold for micro-layer optimization
+COVERAGE_GATED_PROGRESSION_THRESHOLD = 0.60    # Coverage gating threshold (down from 75%)
+COVERAGE_PARAMETER_ADAPTATION_THRESHOLD = 0.15 # Threshold for parameter adaptations (up from 30%)
+
+# Surface refinement thresholds
+REFINEMENT_LEVEL_MAX_SINGLE_STEP = 1           # Maximum refinement level increase per step
+SURFACE_LEVEL_MINIMUM = 1                      # Minimum surface refinement level
+
+# Memory management constants  
+MEMORY_SAFETY_FACTOR = 0.7                     # Use 70% of available memory
+DEFAULT_CELL_BUDGET_KB_PER_CELL = 1.0          # 1 KB per cell estimate
+MEMORY_THRESHOLD_WARNING_GB = 2.0              # Warn if less than 2GB available
+
+# Geometry quality constants
+STL_QUALITY_CHECK_TIMEOUT = 30                 # Seconds for surface quality check
+MINIMUM_TRIANGLE_QUALITY = 0.1                 # Minimum acceptable triangle quality
+STL_EDGE_LENGTH_RATIO_MAX = 1000.0             # Maximum edge length ratio (1000:1)
+
+# File system constants
+MAX_LOG_FILE_SIZE_MB = 100                     # Maximum log file size in MB
+ITERATION_DIRECTORY_FORMAT = "iter_{:03d}"     # Format for iteration directories
+
+# ============================================================================
+# OPENFOAM VERSION-SPECIFIC CONSTANTS
+# ============================================================================
+
+# OpenFOAM directory structure changed in v12
+# v11 and earlier: constant/triSurface/
+# v12 and later:   constant/geometry/
+OPENFOAM_GEOMETRY_DIR_V11 = "triSurface"       # Pre-v12 geometry directory name
+OPENFOAM_GEOMETRY_DIR_V12 = "geometry"         # v12+ geometry directory name
+
+# Default OpenFOAM version assumptions (can be overridden by detection)
+DEFAULT_OPENFOAM_MAJOR_VERSION = 12            # Assume v12+ by default
+OPENFOAM_VERSION_THRESHOLD_GEOMETRY = 12       # Version where geometry dir changed
+
+# OpenFOAM environment detection
+OPENFOAM_VERSION_COMMAND = "foamVersion 2>/dev/null || echo 'OpenFOAM-unknown'"
+OPENFOAM_ENV_VARS = ["WM_PROJECT_VERSION", "FOAM_VERSION"]

@@ -79,7 +79,7 @@ Examples:
             logger.info(f"Output directory: {args.output}")
             optimizer = Stage1MeshOptimizer(args.geometry, args.config, args.output)
             
-            if args.max_iterations:
+            if args.max_iterations != 4:  # Only override config if user explicitly changed default
                 optimizer.max_iterations = args.max_iterations
                 
             result_dir = optimizer.iterate_until_quality()

@@ -3,12 +3,21 @@
 ## Quick Installation
 
 ### 1. Prerequisites
+
+#### OpenFOAM Version Compatibility
+AortaCFD-Mesh automatically detects your OpenFOAM version and adapts to the correct directory structure:
+- **OpenFOAM v12+**: Uses `constant/geometry/` directory (recommended)
+- **OpenFOAM v11 and earlier**: Uses `constant/triSurface/` directory  
+
 ```bash
-# Install OpenFOAM 12 (Foundation version)
+# Install OpenFOAM 12 (Foundation version) - Recommended
 sudo sh -c "wget -O - https://dl.openfoam.org/gpg.key | apt-key add -"
 sudo add-apt-repository http://dl.openfoam.org/ubuntu
 sudo apt-get update
 sudo apt-get install openfoam12
+
+# Alternative: OpenFOAM 11 (also supported)
+# sudo apt-get install openfoam11
 
 # Install Python 3.8+
 sudo apt-get install python3 python3-pip python3-dev

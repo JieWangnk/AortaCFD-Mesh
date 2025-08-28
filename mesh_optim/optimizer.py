@@ -22,7 +22,11 @@ from .constants import (
     FIRST_LAYER_MIN,
     FIRST_LAYER_REDUCTION_FACTOR,
     COVERAGE_PLATEAU_THRESHOLD,
-    COVERAGE_PLATEAU_ITERATIONS
+    COVERAGE_PLATEAU_ITERATIONS,
+    COVERAGE_GATED_PROGRESSION_THRESHOLD,
+    COVERAGE_PARAMETER_ADAPTATION_THRESHOLD,
+    COVERAGE_THRESHOLD_MICRO_OPTIMIZATION,
+    MEMORY_SAFETY_FACTOR
 )
 from .legacy_functions import (
     run_command,
@@ -67,7 +71,20 @@ class Stage1Optimizer:
             min_layer_cov=float(acceptance.get("min_layer_coverage", 0.65)),
         )
 
-    def run_mesh_generation(self, iter_dir: Path, force_full_remesh: bool = True) -> Tuple[Dict, Dict, Dict]:
+    def _ensure_clean_baseline(self, iter_dir: Path, trial_num: int = None) -> None:
+        """Ensure clean baseline by removing stale refinement data.
+        
+        This prevents "Number of cells in mesh does not equal size of cellLevel" errors
+        by forcing OpenFOAM to recalculate refinement levels from a clean state.
+        """
+        if trial_num and trial_num > 1:
+            polymesh_dir = iter_dir / "constant" / "polyMesh"
+            if polymesh_dir.exists():
+                import shutil
+                shutil.rmtree(polymesh_dir)
+                self.logger.debug(f"Removed polyMesh directory for clean baseline in trial {trial_num}")
+
+    def run_mesh_generation(self, iter_dir: Path, force_full_remesh: bool = True, trial_num: int = None) -> Tuple[Dict, Dict, Dict]:
         """Run mesh generation with enhanced error handling.
         
         Returns:
@@ -76,6 +93,9 @@ class Stage1Optimizer:
         env = self.config["openfoam_env_path"]
         logs = iter_dir / "logs"
         logs.mkdir(exist_ok=True)
+        
+        # Ensure clean baseline for micro-trials to prevent refinement inconsistencies
+        self._ensure_clean_baseline(iter_dir, trial_num)
         
         if not force_full_remesh:
             self.logger.info("Layers-only optimization possible, but running full remesh for robustness")
@@ -126,7 +146,7 @@ class Stage1Optimizer:
                 return snap_metrics, snap_metrics, empty_coverage
             
             # LAYERS phase
-            layer_metrics, layer_coverage = self._run_layer_addition(iter_dir, logs, env, n_procs)
+            layer_metrics, layer_coverage = self._run_layer_addition(iter_dir, logs, env, n_procs, trial_num)
             
             return snap_metrics, layer_metrics, layer_coverage
             
@@ -137,7 +157,7 @@ class Stage1Optimizer:
             return error_metrics, error_metrics, error_coverage
 
     def _run_mesh_without_layers(self, iter_dir: Path, logs: Path, env: str, n_procs: int) -> Dict:
-        """Run castellation and snapping phases."""
+        """Run castellation and snapping phases and create checkpoint."""
         # Copy appropriate dictionary
         shutil.copy2(iter_dir / "system" / "snappyHexMeshDict.noLayer", 
                      iter_dir / "system" / "snappyHexMeshDict")
@@ -182,9 +202,165 @@ class Stage1Optimizer:
         
         # Quality check
         snap_metrics = self._check_mesh_quality(iter_dir, env, n_procs)
+        
+        # Create mesh checkpoint for micro-trials (only if mesh is OK)
+        if snap_metrics.get("meshOK", False):
+            self._create_mesh_checkpoint(iter_dir, n_procs)
+            self.logger.info("💾 Base mesh checkpoint created for efficient micro-trials")
+            
         return snap_metrics
 
-    def _run_layer_addition(self, iter_dir: Path, logs: Path, env: str, n_procs: int) -> Tuple[Dict, Dict]:
+    def _create_mesh_checkpoint(self, iter_dir: Path, n_procs: int):
+        """Create checkpoint of mesh without layers for micro-trials."""
+        checkpoint_dir = iter_dir / "polyMesh.checkpoint"
+        
+        try:
+            # Remove existing checkpoint if it exists
+            if checkpoint_dir.exists():
+                shutil.rmtree(checkpoint_dir)
+            
+            # Create checkpoint directory
+            checkpoint_dir.mkdir(exist_ok=True)
+            
+            if n_procs > 1:
+                # For parallel mesh, save all processor directories
+                for proc_dir in iter_dir.glob("processor*"):
+                    if proc_dir.is_dir():
+                        proc_polymesh = proc_dir / "constant" / "polyMesh"
+                        if proc_polymesh.exists():
+                            checkpoint_proc = checkpoint_dir / proc_dir.name
+                            checkpoint_proc.mkdir(exist_ok=True)
+                            shutil.copytree(proc_polymesh, checkpoint_proc / "polyMesh")
+                self.logger.debug(f"Created parallel mesh checkpoint with {len(list(iter_dir.glob('processor*')))} processors")
+            else:
+                # For serial mesh, save main polyMesh
+                main_polymesh = iter_dir / "constant" / "polyMesh"
+                if main_polymesh.exists():
+                    shutil.copytree(main_polymesh, checkpoint_dir / "polyMesh")
+                self.logger.debug("Created serial mesh checkpoint")
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to create mesh checkpoint: {e}")
+
+    def _restore_mesh_checkpoint(self, iter_dir: Path, n_procs: int) -> bool:
+        """Restore mesh without layers from checkpoint for micro-trial."""
+        checkpoint_dir = iter_dir / "polyMesh.checkpoint"
+        
+        if not checkpoint_dir.exists():
+            self.logger.warning("No mesh checkpoint found - cannot restore base mesh")
+            return False
+            
+        try:
+            if n_procs > 1:
+                # Restore parallel mesh - clean and restore all processor directories
+                for proc_dir in iter_dir.glob("processor*"):
+                    if proc_dir.is_dir():
+                        proc_polymesh = proc_dir / "constant" / "polyMesh"
+                        if proc_polymesh.exists():
+                            shutil.rmtree(proc_polymesh)
+                        
+                        # Restore from checkpoint
+                        checkpoint_proc = checkpoint_dir / proc_dir.name / "polyMesh"
+                        if checkpoint_proc.exists():
+                            proc_polymesh.parent.mkdir(exist_ok=True)
+                            shutil.copytree(checkpoint_proc, proc_polymesh)
+                            
+                self.logger.debug("Restored parallel mesh from checkpoint")
+            else:
+                # Restore serial mesh
+                main_polymesh = iter_dir / "constant" / "polyMesh"
+                if main_polymesh.exists():
+                    shutil.rmtree(main_polymesh)
+                    
+                checkpoint_polymesh = checkpoint_dir / "polyMesh"
+                if checkpoint_polymesh.exists():
+                    shutil.copytree(checkpoint_polymesh, main_polymesh)
+                    self.logger.debug("Restored serial mesh from checkpoint")
+                else:
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to restore mesh checkpoint: {e}")
+            return False
+
+    def _save_best_mesh_result(self, iter_dir: Path, n_procs: int):
+        """Save the best mesh result from micro-trials."""
+        best_result_dir = iter_dir / "polyMesh.best_result"
+        
+        try:
+            # Remove existing best result if it exists
+            if best_result_dir.exists():
+                shutil.rmtree(best_result_dir)
+            
+            # Create best result directory
+            best_result_dir.mkdir(exist_ok=True)
+            
+            if n_procs > 1:
+                # For parallel mesh, save all processor directories
+                for proc_dir in iter_dir.glob("processor*"):
+                    if proc_dir.is_dir():
+                        proc_polymesh = proc_dir / "constant" / "polyMesh"
+                        if proc_polymesh.exists():
+                            best_proc = best_result_dir / proc_dir.name
+                            best_proc.mkdir(exist_ok=True)
+                            shutil.copytree(proc_polymesh, best_proc / "polyMesh")
+                self.logger.debug("Saved best parallel mesh result")
+            else:
+                # For serial mesh, save main polyMesh
+                main_polymesh = iter_dir / "constant" / "polyMesh"
+                if main_polymesh.exists():
+                    shutil.copytree(main_polymesh, best_result_dir / "polyMesh")
+                self.logger.debug("Saved best serial mesh result")
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to save best mesh result: {e}")
+
+    def _restore_best_mesh_result(self, iter_dir: Path, n_procs: int) -> bool:
+        """Restore the best mesh result from micro-trials."""
+        best_result_dir = iter_dir / "polyMesh.best_result"
+        
+        if not best_result_dir.exists():
+            self.logger.debug("No best result checkpoint found")
+            return False
+            
+        try:
+            if n_procs > 1:
+                # Restore parallel mesh - clean and restore all processor directories
+                for proc_dir in iter_dir.glob("processor*"):
+                    if proc_dir.is_dir():
+                        proc_polymesh = proc_dir / "constant" / "polyMesh"
+                        if proc_polymesh.exists():
+                            shutil.rmtree(proc_polymesh)
+                        
+                        # Restore from best result
+                        best_proc = best_result_dir / proc_dir.name / "polyMesh"
+                        if best_proc.exists():
+                            proc_polymesh.parent.mkdir(exist_ok=True)
+                            shutil.copytree(best_proc, proc_polymesh)
+                            
+                self.logger.debug("Restored best parallel mesh result")
+            else:
+                # Restore serial mesh
+                main_polymesh = iter_dir / "constant" / "polyMesh"
+                if main_polymesh.exists():
+                    shutil.rmtree(main_polymesh)
+                    
+                best_polymesh = best_result_dir / "polyMesh"
+                if best_polymesh.exists():
+                    shutil.copytree(best_polymesh, main_polymesh)
+                    self.logger.debug("Restored best serial mesh result")
+                else:
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to restore best mesh result: {e}")
+            return False
+
+    def _run_layer_addition(self, iter_dir: Path, logs: Path, env: str, n_procs: int, trial_num: int = None) -> Tuple[Dict, Dict]:
         """Run boundary layer addition phase."""
         # Clean up refinement level files from previous snappyHexMesh runs
         # to prevent "Number of cells in mesh does not equal size of cellLevel" errors
@@ -317,6 +493,11 @@ class Stage1Optimizer:
         max_retries = int(self.stage1.get("micro_layer_retries", 0))
         if max_retries <= 0:
             return None, None
+            
+        # Gradual micro-retry approach: start with fewer retries, increase if successful
+        # This reduces probability of hitting consistency issues while allowing exploration
+        base_retries = min(2, max_retries)  # Start with max 2 retries
+        self.logger.info(f"Using gradual retry approach: {base_retries}/{max_retries} retries initially")
 
         # Ensure iter_dir is a Path object
         iter_dir = Path(iter_dir)
@@ -328,9 +509,9 @@ class Stage1Optimizer:
         best_metrics = None
         best_cov_obj = base_coverage
 
-        self.logger.info(f"🔁 MICRO-LOOP: up to {max_retries} layers-only retries")
+        self.logger.info(f"🔁 MICRO-LOOP: up to {base_retries} layers-only retries (gradual approach)")
         
-        for t in range(1, max_retries + 1):
+        for t in range(1, base_retries + 1):
             # Progressive parameter tuning strategy
             L = self.layers
             is_rel = bool(L.get("relativeSizes", False))
@@ -350,11 +531,11 @@ class Stage1Optimizer:
             # Lower ER slightly for stability
             L["expansionRatio"] = max(1.10, min(1.18, float(L.get("expansionRatio", 1.15)) - 0.01))
 
-            # Gentle nGrow (0→1→2 max)
-            L["nGrow"] = min(int(L.get("nGrow", 0)) + 1, 2)
-            # More smoothing/relaxation
-            L["nSmoothSurfaceNormals"] = min(12, int(L.get("nSmoothSurfaceNormals", 5)) + 2)
-            L["nRelaxIter"] = min(12, int(L.get("nRelaxIter", 5)) + 2)
+            # Conservative nGrow (0→1 max) to avoid destabilization
+            L["nGrow"] = min(int(L.get("nGrow", 0)) + 1, 1)
+            # Gradual smoothing/relaxation increases (+1 instead of +2)
+            L["nSmoothSurfaceNormals"] = min(10, int(L.get("nSmoothSurfaceNormals", 5)) + 1)
+            L["nRelaxIter"] = min(10, int(L.get("nRelaxIter", 5)) + 1)
             L["nLayerIter"] = max(60, int(L.get("nLayerIter", 50)))
 
             self.logger.info(f"  MICRO try {t}: t1_rel={L.get('firstLayerThickness', 'abs')}, "
@@ -376,17 +557,27 @@ class Stage1Optimizer:
             dict_generator = OpenFOAMDictGenerator(self.config, self.wall_name, self.logger)
             dict_generator._generate_snappy_layers_dict(iter_dir, outlet_names, internal_point, dx_base)
 
-            # Run layers-only pass
-            metrics, cov = self._run_layers_only_pass(iter_dir, logs, env, n_procs)
-            
-            cov_now = float(cov.get("coverage_overall", 0.0))
-            self.logger.info(f"  MICRO try {t} result: coverage={cov_now*100:.1f}%, "
-                           f"skew={metrics.get('maxSkewness', 0):.2f}, nonOrtho={metrics.get('maxNonOrtho', 0):.1f}")
+            # Run layers-only pass with error handling for exploratory approach
+            # Note: Checkpoint restoration happens inside _run_layers_only_pass for t > 1
+            try:
+                metrics, cov = self._run_layers_only_pass(iter_dir, logs, env, n_procs, trial_num=t)
+                
+                cov_now = float(cov.get("coverage_overall", 0.0))
+                self.logger.info(f"  MICRO try {t} result: coverage={cov_now*100:.1f}%, "
+                               f"skew={metrics.get('maxSkewness', 0):.2f}, nonOrtho={metrics.get('maxNonOrtho', 0):.1f}")
 
-            if cov_now > best_cov:
-                best_cov = cov_now
-                best_metrics = metrics
-                best_cov_obj = cov
+                if cov_now > best_cov:
+                    best_cov = cov_now
+                    best_metrics = metrics
+                    best_cov_obj = cov
+                    
+                    # Save the best mesh result as checkpoint
+                    self._save_best_mesh_result(iter_dir, n_procs)
+                    
+            except Exception as e:
+                self.logger.warning(f"  MICRO try {t} failed: {e}")
+                self.logger.info("  Continuing with best result so far (exploratory approach)")
+                break  # Exit micro-loop but return best achieved
 
             # Stop early if we crossed an OK band (e.g. 60%+)
             if cov_now >= max(0.60, self.targets.min_layer_cov - 0.05):
@@ -395,16 +586,64 @@ class Stage1Optimizer:
 
         if best_metrics and best_cov_obj and best_cov > float(base_coverage.get("coverage_overall", 0.0)):
             self.logger.info(f"Micro-loop improved coverage: {float(base_coverage.get('coverage_overall', 0.0))*100:.1f}% → {best_cov*100:.1f}%")
+            
+            # Restore the best mesh result as the final mesh
+            if not self._restore_best_mesh_result(iter_dir, n_procs):
+                self.logger.warning("Failed to restore best micro-trial result - using current mesh state")
+            
             return best_metrics, best_cov_obj
         
         return None, None
 
-    def _run_layers_only_pass(self, iter_dir: Path, logs: Path, env: str, n_procs: int) -> Tuple[Dict, Dict]:
-        """Run a single layers-only snappyHexMesh pass."""
+    def _cleanup_parallel_mesh(self, iter_dir: Path, n_procs: int):
+        """Clean up parallel decomposition and mesh files from previous trials."""
+        import shutil
+        from pathlib import Path
+        
+        iter_dir = Path(iter_dir)
+        
+        # Remove processor directories
+        for i in range(n_procs):
+            proc_dir = iter_dir / f"processor{i}"
+            if proc_dir.exists():
+                shutil.rmtree(proc_dir)
+        
+        # Remove ALL refinement level files (critical for snappyHexMesh consistency)
+        polyMesh_dir = iter_dir / "constant" / "polyMesh"
+        if polyMesh_dir.exists():
+            refinement_files = [
+                "cellLevel", "pointLevel", "level0Edge", 
+                "cellProc", "faceProc", "pointProc", "boundaryProc",
+                "surfaceIndex"
+            ]
+            for rfile in refinement_files:
+                rfile_path = polyMesh_dir / rfile
+                if rfile_path.exists():
+                    rfile_path.unlink()
+        
+        # Also clean refinement files in time directories (0/, 1/, etc.)
+        for time_dir in iter_dir.glob("[0-9]*"):
+            if time_dir.is_dir():
+                for rfile in ["cellLevel", "pointLevel", "nSurfaceLayers", "thickness", "thicknessFraction"]:
+                    rfile_path = time_dir / rfile
+                    if rfile_path.exists():
+                        rfile_path.unlink()
+        
+        self.logger.debug(f"Cleaned up refinement data for micro-trial consistency")
+
+    def _run_layers_only_pass(self, iter_dir: Path, logs: Path, env: str, n_procs: int, trial_num: int = None) -> Tuple[Dict, Dict]:
+        """Run a single layers-only snappyHexMesh pass with checkpoint restore."""
         # Ensure paths are Path objects
         from pathlib import Path
+        import datetime
         iter_dir = Path(iter_dir)
         logs = Path(logs)
+        
+        # CRITICAL: Restore base mesh from checkpoint before each micro-trial
+        if trial_num is not None and trial_num > 1:
+            if not self._restore_mesh_checkpoint(iter_dir, n_procs):
+                self.logger.warning(f"Failed to restore checkpoint for micro-trial {trial_num}")
+                # Continue anyway - might work if mesh is still clean
         
         # Copy layers dict to main dict
         shutil.copy2(iter_dir / "system" / "snappyHexMeshDict.layers", 
@@ -415,7 +654,14 @@ class Stage1Optimizer:
         if n_procs > 1:
             cmd = ["mpirun", "-np", str(n_procs)] + cmd + ["-parallel"]
         
-        log_path = logs / "log.snappy.layers.micro"
+        # Create timestamped log filename to preserve micro-trial logs
+        if trial_num is not None:
+            timestamp = datetime.datetime.now().strftime("%H%M%S")
+            log_name = f"log.snappy.layers.micro_trial{trial_num:02d}_{timestamp}"
+        else:
+            log_name = "log.snappy.layers.micro"
+        
+        log_path = logs / log_name
         res = run_command(cmd, cwd=iter_dir, env_setup=env, timeout=None, 
                         max_memory_gb=self.max_memory_gb, log_file=str(log_path))
 
@@ -445,17 +691,26 @@ class Stage1Optimizer:
         return layer_m.get("cells", snap_m.get("cells", 0))
 
     def apply_parameter_adaptations(self, coverage: float, trial: int, max_trials: int):
-        """Apply quick parameter back-offs for improved coverage."""
+        """Apply conservative parameter adjustments for improved coverage.
+        
+        Stability improvements:
+        - Limit nGrow to max 1 (instead of 2) to avoid destabilization
+        - Gradual smoothing increases (+1 instead of +2)  
+        - Avoid sizing mode switches within iteration (only first trial if coverage < 30%)
+        """
         if trial >= max_trials:
             return  # No more trials
         
         self.logger.info(f"Applying parameter adaptations for trial {trial+1}")
         
-        # Apply relative sizing if not already enabled and coverage is poor
-        if coverage < 0.40 and not self.layers.get("relativeSizes", False):
-            self.logger.info("Enabling relativeSizes for complex geometry adaptation")
+        # Avoid sizing mode switches within same iteration for stability
+        # Only switch to relative sizing on first trial if coverage is extremely poor
+        if coverage < COVERAGE_PARAMETER_ADAPTATION_THRESHOLD and trial == 1 and not self.layers.get("relativeSizes", False):
+            self.logger.info(f"Enabling relativeSizes for severely poor coverage (< {COVERAGE_PARAMETER_ADAPTATION_THRESHOLD*100:.0f}%, first trial only)")
             self.layers["relativeSizes"] = True
-            self.layers["firstLayerThickness"] = 0.2  # Start with 20% of local cell size
+            from .constants import RELATIVE_SIZING_FIRST_LAYER
+            self.layers["firstLayerThickness"] = RELATIVE_SIZING_FIRST_LAYER  # Start with conservative sizing
+        # Otherwise maintain current sizing mode throughout iteration
         
         # Reduce expansion ratio slightly
         current_er = self.layers.get("expansionRatio", 1.2)
@@ -502,7 +757,7 @@ class Stage1Optimizer:
             return proposed_levels, True  # First iteration, allow progression
         
         prev_coverage = previous_coverage.get("coverage_overall", 0.0)
-        coverage_threshold = 0.75  # Only progress if previous coverage >= 75%
+        coverage_threshold = COVERAGE_GATED_PROGRESSION_THRESHOLD  # Only progress if previous coverage >= threshold
         
         # Check if we're increasing refinement
         current_levels = getattr(self, 'surface_levels', [1, 1])

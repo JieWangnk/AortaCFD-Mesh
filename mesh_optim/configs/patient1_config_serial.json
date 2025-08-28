@@ -1,0 +1,121 @@
+{
+  "description": "SERIAL configuration for patient1: Single processor to avoid parallel mesh distribution errors",
+  
+  "openfoam_env_path": "source /opt/openfoam12/etc/bashrc",
+  
+  "SCALING": { 
+    "scale_m": 0.001 
+  },
+  
+  "mesh": {
+    "base_size_mode": "diameter",
+    "cells_per_diameter": 18,
+    "min_cells_per_throat": 22
+  },
+  
+  "refinement": {
+    "surface_levels": [1, 2],
+    "near_band_dx": 6,
+    "far_band_dx": 12,
+    "feature_angle": {
+      "mode": "adaptive",
+      "init": 45,
+      "step": 5
+    }
+  },
+  
+  "layers": {
+    "n": 5,
+    "expansion": 1.18,
+    "relativeSizes": true,
+    "minThickness": 0.12,
+    "first_layer": {
+      "mode": "relative",
+      "t1_rel": 0.22,
+      "T_rel": 0.72
+    }
+  },
+  
+  "physics": {
+    "solver_mode": "RANS",
+    "flow_model": "turbulent",
+    "y_plus": 30,
+    "U_peak": 0.8,
+    "rho": 1060.0,
+    "mu": 0.0035
+  },
+  
+  "accept": {
+    "maxNonOrtho": 75,
+    "maxSkewness": 4.5,
+    "min_layer_coverage": 0.65
+  },
+  
+  "compute": {
+    "procs": 1,
+    "max_memory_gb": 0,
+    "cell_budget_kb_per_cell": 1.5
+  },
+  
+  "iterations": {
+    "max": 1,
+    "ladder": [[1,2]],
+    "use_coverage_gated_progression": false,
+    "micro_layer_retries": 4
+  },
+  
+  "advanced": {
+    "BLOCKMESH": {
+      "resolution": 80,
+      "grading": [1, 1, 1]
+    },
+    "SNAPPY": {
+      "maxGlobalCells": 2000000,
+      "maxLocalCells": 2000000,
+      "nCellsBetweenLevels": 4,
+      "resolveFeatureAngle": 45,
+      "tolerance": 3.0,
+      "nSolveIter": 60,
+      "nRelaxIter": 15,
+      "nFeatureSnapIter": 15,
+      "implicitFeatureSnap": false,
+      "explicitFeatureSnap": true,
+      "nSmoothPatch": 10
+    },
+    "LAYERS": {
+      "nSurfaceLayers": 5,
+      "expansionRatio": 1.18,
+      "nGrow": 0,
+      "featureAngle": 70,
+      "maxThicknessToMedialRatio": 0.65,
+      "minMedianAxisAngle": 55,
+      "nSmoothSurfaceNormals": 10,
+      "nSmoothNormals": 12,
+      "nRelaxIter": 12,
+      "nLayerIter": 80,
+      "nRelaxedIter": 35,
+      "maxFaceThicknessRatio": 0.65,
+      "slipFeatureAngle": 35,
+      "nSmoothThickness": 12,
+      "nSmoothDisplacement": 100,
+      "nMedialAxisIter": 15
+    }
+  },
+  
+  "SURFACE_FEATURES": {
+    "includedAngle": 155
+  },
+  
+  "STAGE1": {
+    "use_coverage_gated_progression": false,
+    "autoFirstLayerFromDx": true,
+    "alpha_total_layers": 0.72,
+    "t1_min_fraction_of_dx": 0.020,
+    "t1_max_fraction_of_dx": 0.065,
+    "band_override": {
+      "enabled": true,
+      "near_cells": 6,
+      "far_cells": 12
+    }
+  }
+}

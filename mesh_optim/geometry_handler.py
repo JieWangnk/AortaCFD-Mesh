@@ -2,8 +2,10 @@
 
 import shutil
 import logging
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple
+from .utils import get_openfoam_geometry_dir
 
 
 class GeometryHandler:
@@ -54,7 +56,8 @@ class GeometryHandler:
     
     def copy_and_scale_stl_files(self, iter_dir: Path) -> List[str]:
         """Copy and scale STL files to iteration directory."""
-        tri_surface_dir = iter_dir / "constant" / "triSurface"
+        geometry_dir = get_openfoam_geometry_dir()
+        tri_surface_dir = iter_dir / "constant" / geometry_dir
         tri_surface_dir.mkdir(parents=True, exist_ok=True)
         
         # Get scaling factor from config
@@ -186,45 +189,73 @@ class GeometryHandler:
         return angle
     
     def calculate_seed_point(self, bbox_data: Dict, stl_map: Dict, dx_base: float) -> List[float]:
-        """Calculate internal seed point for mesh generation using scaled inlet centroid."""
-        # Find inlet STL file from stl_map (scaled STL files in triSurface directory)
-        inlet_path = None
-        if stl_map and "inlet" in stl_map:
-            inlet_path = stl_map["inlet"]
+        """Calculate internal seed point using the PROVEN robust method."""
+        from .geometry_utils import find_internal_seed_point, read_stl_triangles
+        import numpy as np
+        
+        # Get bbox info - handle both mesh_domain and direct bbox formats
+        if "mesh_domain" in bbox_data:
+            bbox_min = np.array([
+                bbox_data["mesh_domain"]["x_min"],
+                bbox_data["mesh_domain"]["y_min"], 
+                bbox_data["mesh_domain"]["z_min"]
+            ])
+            bbox_max = np.array([
+                bbox_data["mesh_domain"]["x_max"],
+                bbox_data["mesh_domain"]["y_max"],
+                bbox_data["mesh_domain"]["z_max"]
+            ])
+        elif "bbox_min" in bbox_data and "bbox_max" in bbox_data:
+            bbox_min = np.array(bbox_data["bbox_min"])
+            bbox_max = np.array(bbox_data["bbox_max"])
         else:
-            # Fallback: search in geometry directory
-            for stl_file in self.geometry_dir.glob("*.stl"):
-                if "inlet" in stl_file.stem.lower():
-                    inlet_path = stl_file
+            self.logger.warning("No bounding box data - using origin")
+            return [0.0, 0.0, 0.0]
+            
+        bbox_center = (bbox_min + bbox_max) / 2.0
+        bbox_size = bbox_max - bbox_min
+        
+        # Find inlet STL file
+        inlet_path = None
+        if "inlet" in stl_map:
+            inlet_path = stl_map["inlet"]
+        elif stl_map and "required" in stl_map and "inlet" in stl_map["required"]:
+            inlet_path = stl_map["required"]["inlet"]
+        else:
+            # Search for inlet file
+            for key, path in stl_map.items():
+                if "inlet" in str(path).lower():
+                    inlet_path = path
                     break
         
-        if inlet_path and inlet_path.exists():
-            try:
-                # Read inlet STL and calculate centroid
-                inlet_centroid = self._calculate_inlet_centroid(inlet_path)
-                self.logger.info(f"Using inlet centroid as seed point: ({inlet_centroid[0]:.3f}, {inlet_centroid[1]:.3f}, {inlet_centroid[2]:.3f})")
-                return inlet_centroid
-            except Exception as e:
-                self.logger.warning(f"Could not calculate inlet centroid: {e}")
+        if not inlet_path or not Path(inlet_path).exists():
+            self.logger.warning("No inlet STL found - using bbox center")
+            return bbox_center.tolist()
         
-        # Fallback to bbox center offset towards inlet region
-        if "bbox_min" in bbox_data and "bbox_max" in bbox_data:
-            bbox_min = bbox_data["bbox_min"]
-            bbox_max = bbox_data["bbox_max"]
+        # Read inlet triangles using proven robust method
+        try:
+            inlet_triangles = read_stl_triangles(Path(inlet_path))
+            if not inlet_triangles:
+                self.logger.warning("No triangles in inlet STL - using bbox center")
+                return bbox_center.tolist()
+                
+            self.logger.info(f"Read {len(inlet_triangles)} triangles from inlet STL")
             
-            # Offset center towards expected inlet region (typically negative Z in aortic models)
-            center = [
-                (bbox_min[0] + bbox_max[0]) / 2.0,
-                (bbox_min[1] + bbox_max[1]) / 2.0,
-                bbox_min[2] + 0.3 * (bbox_max[2] - bbox_min[2])  # Offset towards lower Z
-            ]
-            self.logger.info(f"Using bbox-based seed point: ({center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f})")
-        else:
-            # Default center point - should be avoided
-            center = [0.0, 0.0, 0.0]
-            self.logger.warning("Using default center point - may not be inside geometry")
-        
-        return center
+            # Use the proven robust seed point calculation
+            seed_point = find_internal_seed_point(
+                bbox_center,
+                bbox_size, 
+                inlet_triangles,
+                dx_base,
+                self.logger
+            )
+            
+            return seed_point.tolist()
+            
+        except Exception as e:
+            self.logger.error(f"Robust seed point calculation failed: {e}")
+            self.logger.warning("Falling back to bbox center")
+            return bbox_center.tolist()
     
     def _calculate_inlet_centroid(self, inlet_path: Path) -> List[float]:
         """Calculate centroid of inlet STL vertices."""
@@ -261,12 +292,68 @@ class GeometryHandler:
             else:
                 raise ValueError("No vertices found in inlet STL")
 
+    def validate_surface_quality(self, warn_only: bool = True) -> Dict[str, bool]:
+        """Validate STL surface quality using OpenFOAM's surfaceCheck.
+        
+        Returns dict with validation results for each surface.
+        If warn_only=False, raises exception on serious quality issues.
+        """
+        results = {}
+        env_setup = self.config.get("openfoam_env_path", "source /opt/openfoam12/etc/bashrc")
+        
+        for surface_type, stl_list in self.stl_files.items():
+            if surface_type == "outlets":
+                for outlet_file in stl_list:
+                    results[outlet_file.name] = self._check_single_surface(outlet_file, env_setup, warn_only)
+            else:
+                for stl_file in stl_list:
+                    results[stl_file.name] = self._check_single_surface(stl_file, env_setup, warn_only)
+        
+        return results
+    
+    def _check_single_surface(self, stl_file: Path, env_setup: str, warn_only: bool) -> bool:
+        """Check single STL surface quality."""
+        try:
+            cmd = f"{env_setup} && surfaceCheck {stl_file}"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            
+            output = result.stdout + result.stderr
+            
+            # Check for critical issues
+            is_closed = "Surface is not closed" not in output
+            has_good_quality = "min" in output and "1e-10" not in output  # Very small triangles
+            no_overlaps = "More than one normal orientation" not in output
+            
+            surface_ok = is_closed and has_good_quality and no_overlaps
+            
+            if not surface_ok:
+                issues = []
+                if not is_closed: issues.append("open surface")
+                if not has_good_quality: issues.append("poor triangle quality")  
+                if not no_overlaps: issues.append("inconsistent normals")
+                
+                msg = f"Surface quality issues in {stl_file.name}: {', '.join(issues)}"
+                if warn_only:
+                    self.logger.warning(msg)
+                    self.logger.warning("Consider using geometry-tolerant configuration for stability")
+                else:
+                    raise ValueError(msg)
+            
+            return surface_ok
+            
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"Surface check timeout for {stl_file.name}")
+            return False
+        except Exception as e:
+            self.logger.warning(f"Surface check failed for {stl_file.name}: {e}")
+            return False
 
-# Backward compatibility functions
+
+# Backward compatibility functions (deprecated - use GeometryHandler methods instead)
 def estimate_reference_diameters(stl_files: List[Path], logger=None) -> Tuple[float, float]:
-    """Backward compatibility function."""
+    """Deprecated: Use GeometryHandler.estimate_reference_diameters() instead."""
     if logger:
-        logger.info("Using simplified diameter estimation")
+        logger.warning("Using deprecated estimate_reference_diameters function. Use GeometryHandler.estimate_reference_diameters() instead.")
     return 0.020, 0.015
 
 def adaptive_feature_angle(size_ratio: float, n_branches: int, curvature: float = 1.0) -> int:

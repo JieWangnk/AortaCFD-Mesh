@@ -19,6 +19,7 @@ from .constants import (
     MIN_THICKNESS_FRACTION,
     FIRST_LAYER_DEFAULT
 )
+from .utils import safe_float, safe_int
 
 
 class OpenFOAMDictGenerator:
@@ -414,18 +415,7 @@ mergeTolerance {self.snappy.get('mergeTolerance', 1e-6)};
                                         L: dict, is_rel: bool, first_line: str, final_line: str, min_line: str) -> str:
         """Generate enhanced layers dictionary content with proper relative/absolute handling."""
         # Ensure all numeric values are properly typed to prevent string division errors
-        def safe_float(val, default=0.0):
-            try:
-                return float(val) if val is not None else default
-            except (ValueError, TypeError):
-                return default
-        
-        def safe_int(val, default=0):
-            try:
-                return int(val) if val is not None else default
-            except (ValueError, TypeError):
-                return default
-        
+        # Using centralized safe conversion functions from utils
         # Convert all layer configuration values to proper types
         expansion_ratio = safe_float(L.get("expansionRatio", 1.2))
         feature_angle = safe_float(L.get("featureAngle", 60))
