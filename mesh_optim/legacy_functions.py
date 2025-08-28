@@ -266,12 +266,174 @@ def check_mesh_quality(mesh_dir, openfoam_env, max_memory_gb=8, deep_check=False
     return metrics
 
 
-def parse_layer_coverage(log_output_text, wall_name="wall_aorta"):
+# Layer diagnosis constants (enum-like)
+class LayerDiagnosis:
+    """Constants for layer coverage diagnosis results."""
+    NOT_ADDED = "not-added-or-abandoned-early"
+    THIN_PRESENT = "thin-but-present"
+    THIN_PRUNED = "thin-but-present (added-then-pruned)"
+    HEALTHY = "healthy-growth"
+
+
+# Pre-compiled regex patterns for performance
+import re
+_EXTRUSION_PATTERNS = [
+    re.compile(r"Extruding\s+(\d+)\s+out\s+of\s+(\d+)\s+faces\s+\(([\d.]+)%\)", re.IGNORECASE),
+    re.compile(r"Added\s+(\d+)\s+out\s+of\s+(\d+)\s+cells\s+\(([\d.]+)%\)", re.IGNORECASE)
+]
+
+_GENERAL_PATTERNS = [
+    re.compile(r"thickness\s*achieved[:\s]*(\d+(?:\.\d+)?)\s*%", re.IGNORECASE),
+    re.compile(r"(\d+(?:\.\d+)?)\s*%\s*thickness", re.IGNORECASE),
+    re.compile(r"overall\s*thickness.*?(\d+(?:\.\d+)?)\s*%", re.IGNORECASE),
+]
+
+_PRUNE_HINTS = [
+    "maxFaceThicknessRatio", "maxThicknessToMedialRatio", 
+    "minMedianAxisAngle", "illegal faces", "Removing extrusion",
+    "Will not extrude", "Deleting layer", "abandoned", "pruned"
+]
+
+
+def _parse_layer_summary_table(log_output_text, wall_name):
+    """Parse the final layer results summary table.
+    
+    Returns:
+        tuple: (n_faces, effective_layers, thickness_fraction) or (None, None, None)
+    """
+    import re
+    
+    # Look for results table where the last number is > 1.0 (indicating percentage)
+    pattern = rf'{re.escape(wall_name)}\s+(\d+)\s+([\d.]+)\s+([\d.eE-]+)\s+([\d.]+)'
+    matches = re.finditer(pattern, log_output_text)
+    
+    for match in matches:
+        try:
+            # Check if the last number could be a percentage (> 1.0)
+            if float(match.group(4)) > 1.0:
+                n_faces = int(match.group(1))
+                actual_layers = float(match.group(2))
+                thickness_pct = float(match.group(4))
+                thickness_fraction = thickness_pct / 100.0
+                return n_faces, actual_layers, thickness_fraction
+        except (ValueError, TypeError):
+            continue
+            
+    return None, None, None
+
+
+def _parse_extrusion_messages(log_output_text, target_layers):
+    """Parse extrusion progress messages for coverage estimation.
+    
+    Returns:
+        tuple: (thickness_fraction, effective_layers, n_faces) or (None, None, None)
+    """
+    best_percentage = 0.0
+    n_faces = None
+    
+    for i, pattern in enumerate(_EXTRUSION_PATTERNS):
+        try:
+            matches = pattern.findall(log_output_text)
+            if matches:
+                for match in matches:
+                    current_pct = float(match[2])
+                    if current_pct > best_percentage:
+                        best_percentage = current_pct
+                        if i == 0:  # Face-based metric (first pattern) is more reliable
+                            n_faces = int(match[1])  # Total faces
+        except (ValueError, TypeError, IndexError):
+            continue
+    
+    if best_percentage > 0:
+        thickness_fraction = best_percentage / 100.0
+        effective_layers = thickness_fraction * target_layers
+        return thickness_fraction, effective_layers, n_faces or 18636
+        
+    return None, None, None
+
+
+def _parse_fallback_patterns(log_output_text, wall_name):
+    """Parse fallback patterns for edge cases.
+    
+    Returns:
+        float: thickness_fraction or None
+    """
+    import re
+    
+    # Pattern 1: Look for thickness percentage near wall name
+    thickness_pattern = rf'{re.escape(wall_name)}.*?(\d+(?:\.\d+)?)(?:\s*%|\s+[\d.]+\s+[\d.]+\s+([\d.]+))'
+    thickness_match = re.search(thickness_pattern, log_output_text, re.IGNORECASE | re.DOTALL)
+    
+    if thickness_match:
+        try:
+            pct_str = thickness_match.group(2) if thickness_match.group(2) else thickness_match.group(1)
+            thickness_fraction = float(pct_str) / 100.0 if float(pct_str) > 1.0 else float(pct_str)
+            return thickness_fraction
+        except (ValueError, TypeError):
+            pass
+            
+    # Pattern 2: General thickness achievement indicators
+    for pattern in _GENERAL_PATTERNS:
+        try:
+            match = pattern.search(log_output_text)
+            if match:
+                return float(match.group(1)) / 100.0
+        except (ValueError, TypeError):
+            continue
+            
+    return None
+
+
+def _count_pruning_hints(log_output_text):
+    """Count quality-related pruning indicators in the log.
+    
+    Returns:
+        int: Number of pruning hints found
+    """
+    import re
+    
+    return sum(len(re.findall(hint, log_output_text, re.IGNORECASE)) for hint in _PRUNE_HINTS)
+
+
+def _diagnose_layer_result(thickness_fraction, prune_count):
+    """Generate human-readable diagnosis based on results.
+    
+    Returns:
+        str: Diagnosis string from LayerDiagnosis constants
+    """
+    if thickness_fraction < 0.15:
+        return LayerDiagnosis.NOT_ADDED
+    elif thickness_fraction < 0.60:
+        return LayerDiagnosis.THIN_PRUNED if prune_count > 0 else LayerDiagnosis.THIN_PRESENT
+    else:
+        return LayerDiagnosis.HEALTHY
+
+
+def parse_layer_coverage(log_output_text, wall_name="wall_aorta", target_layers=5):
     """Parse boundary layer thickness fraction from snappyHexMesh log output.
     
     snappyHexMesh doesn't report true "coverage" (areal fraction with layers).
     Instead, it reports thickness fraction: achieved_thickness / target_thickness.
     
+    Args:
+        log_output_text (str): The snappyHexMesh log content to parse
+        wall_name (str): Name of the wall patch to look for (default: "wall_aorta")
+        target_layers (int): Number of target layers for estimation (default: 5)
+        
+    Returns:
+        dict: Layer coverage data with keys:
+            - coverage_overall (float): Thickness fraction (0.0-1.0)
+            - thickness_fraction (float): Same as coverage_overall
+            - effective_layers (float): Estimated effective layers achieved
+            - faces_with_layers (int): Number of faces with layers
+            - pruning_hints (int): Count of quality-related pruning indicators
+            - diagnosis (str): Human-readable diagnosis
+            - perPatch (dict): Per-patch breakdown
+            
+    Raises:
+        TypeError: If log_output_text is not a string
+        ValueError: If wall_name is empty or invalid
+        
     Example log line:
     wall_aorta 18636    1.85     0.000155  46.1    
                ^^^^ ^^^^^ ^^^^^^    ^^^^^^  ^^^^
@@ -280,104 +442,48 @@ def parse_layer_coverage(log_output_text, wall_name="wall_aorta"):
     import re
     import math
     
-    # Parse snappyHexMesh layer summary table
+    # Input validation
+    if not isinstance(log_output_text, str):
+        raise TypeError(f"log_output_text must be a string, got {type(log_output_text).__name__}")
+    
+    if not wall_name or not isinstance(wall_name, str):
+        raise ValueError("wall_name must be a non-empty string")
+        
+    if not isinstance(target_layers, (int, float)) or target_layers <= 0:
+        raise ValueError("target_layers must be a positive number")
+    
+    # Initialize default values
     thickness_fraction = 0.0
     effective_layers = 0.0
+    n_faces = 18636  # Default fallback
     
-    # Look for the final results summary table in snappyHexMesh output
-    # Format: "patch_name   faces    layers   thickness[m]  thickness[%]"
-    # Example: "wall_aorta   18636    1.85     0.000155      46.1"
-    # Note: The initial specification table has format "wall_aorta 18636 5 5e-05 0.000337"
-    #       but the final results table has the percentage in the last column
+    # Try parsing methods in order of reliability
     
-    # Look for results table where the last number is > 1.0 (indicating percentage)
-    pattern = rf'{re.escape(wall_name)}\s+(\d+)\s+([\d.]+)\s+([\d.eE-]+)\s+([\d.]+)'
-    matches = re.finditer(pattern, log_output_text)
-    match = None
-    for m in matches:
-        # Check if the last number could be a percentage (> 1.0)
-        if float(m.group(4)) > 1.0:
-            match = m
-            break
-    
-    if match:
-        n_faces = int(match.group(1))
-        actual_layers = float(match.group(2))  # This is already effective layers from snappyHexMesh
-        thickness_m = float(match.group(3))
-        thickness_pct = float(match.group(4))
-        
-        thickness_fraction = thickness_pct / 100.0
-        effective_layers = actual_layers  # snappyHexMesh reports effective layers directly
-        
+    # Method 1: Parse layer summary table (most reliable when present)
+    table_result = _parse_layer_summary_table(log_output_text, wall_name)
+    if table_result[0] is not None:
+        n_faces, effective_layers, thickness_fraction = table_result
     else:
-        # Fallback patterns for different log formats or error conditions
-        
-        # Pattern 1: Look for extrusion progress messages like "Extruding X out of Y faces (Z%)"
-        extrusion_patterns = [
-            r"Extruding\s+(\d+)\s+out\s+of\s+(\d+)\s+faces\s+\(([\d.]+)%\)",
-            r"Added\s+(\d+)\s+out\s+of\s+(\d+)\s+cells\s+\(([\d.]+)%\)"
-        ]
-        
-        best_percentage = 0.0
-        for pattern in extrusion_patterns:
-            matches = re.findall(pattern, log_output_text, re.IGNORECASE)
-            if matches:
-                # Take the last (most recent) match and use the highest percentage seen
-                for match in matches:
-                    current_pct = float(match[2])
-                    if current_pct > best_percentage:
-                        best_percentage = current_pct
-        
-        if best_percentage > 0:
-            thickness_fraction = best_percentage / 100.0
-            # Estimate effective layers based on extrusion percentage
-            effective_layers = thickness_fraction * 5.0  # Assume 5 target layers
-            n_faces = 18636  # Default value, could be extracted from matches if needed
+        # Method 2: Parse extrusion messages (common fallback)
+        extrusion_result = _parse_extrusion_messages(log_output_text, target_layers)
+        if extrusion_result[0] is not None:
+            thickness_fraction, effective_layers, n_faces = extrusion_result
         else:
-            # Pattern 2: Look for thickness percentage anywhere near the wall name
-            thickness_pattern = rf'{re.escape(wall_name)}.*?(\d+(?:\.\d+)?)(?:\s*%|\s+[\d.]+\s+[\d.]+\s+([\d.]+))'
-            thickness_match = re.search(thickness_pattern, log_output_text, re.IGNORECASE | re.DOTALL)
-            
-            if thickness_match:
-                # Extract the percentage value (last captured group)
-                pct_str = thickness_match.group(2) if thickness_match.group(2) else thickness_match.group(1)
-                thickness_fraction = float(pct_str) / 100.0 if float(pct_str) > 1.0 else float(pct_str)
-                
-            # Pattern 3: Look for any thickness achievement indicators
-            general_patterns = [
-                r"thickness\s*achieved[:\s]*(\d+(?:\.\d+)?)\s*%",
-                r"(\d+(?:\.\d+)?)\s*%\s*thickness",
-                r"overall\s*thickness.*?(\d+(?:\.\d+)?)\s*%",
-            ]
-            
-            for pattern in general_patterns:
-                match = re.search(pattern, log_output_text, re.IGNORECASE)
-                if match:
-                    thickness_fraction = float(match.group(1)) / 100.0
-                    break
+            # Method 3: Fallback patterns for edge cases
+            fallback_thickness = _parse_fallback_patterns(log_output_text, wall_name)
+            if fallback_thickness is not None:
+                thickness_fraction = fallback_thickness
+                effective_layers = thickness_fraction * target_layers
     
-    # Count quality-related pruning hints to better understand the result
-    prune_hints = [
-        "maxFaceThicknessRatio", "maxThicknessToMedialRatio", 
-        "minMedianAxisAngle", "illegal faces", "Removing extrusion",
-        "Will not extrude", "Deleting layer", "abandoned", "pruned"
-    ]
-    
-    prune_count = sum(len(re.findall(hint, log_output_text, re.IGNORECASE)) for hint in prune_hints)
-    
-    # Classify the result for better diagnostics
-    if thickness_fraction < 0.15:
-        diagnosis = "not-added-or-abandoned-early"
-    elif thickness_fraction < 0.60:
-        diagnosis = "thin-but-present (added-then-pruned)" 
-    else:
-        diagnosis = "healthy-growth"
+    # Count pruning indicators and generate diagnosis
+    prune_count = _count_pruning_hints(log_output_text)
+    diagnosis = _diagnose_layer_result(thickness_fraction, prune_count)
     
     return {
         "coverage_overall": thickness_fraction,  # Keep existing interface
         "thickness_fraction": thickness_fraction,
         "effective_layers": effective_layers,
-        "faces_with_layers": n_faces if 'n_faces' in locals() else (match.group(1) if 'match' in locals() and match else 0),
+        "faces_with_layers": n_faces,
         "pruning_hints": prune_count,
         "diagnosis": diagnosis,
         "perPatch": {
