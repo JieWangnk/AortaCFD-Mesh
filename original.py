@@ -8,16 +8,44 @@ from pathlib import Path
 import shutil
 import logging
 from dataclasses import dataclass
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 from .utils import (
     run_command, 
     check_mesh_quality, 
     parse_layer_coverage,
+    parse_physics_aware_coverage,
+    log_surface_histogram,
     parse_layer_iterations,
     evaluate_stage1_metrics
 )
 from .physics_mesh import PhysicsAwareMeshGenerator
+from .constants import (
+    FEATURE_ANGLE_DEFAULT,
+    FEATURE_ANGLE_MIN,
+    FEATURE_ANGLE_MAX,
+    FEATURE_ANGLE_RECOMMENDED,
+    FIRST_LAYER_MIN,
+    FIRST_LAYER_MAX,
+    FIRST_LAYER_DEFAULT,
+    MAX_ITERATIONS_DEFAULT,
+    MICRO_TRIALS_PER_ITERATION,
+    COVERAGE_ACCEPTABLE_THRESHOLD,
+    FEATURE_SNAP_ITER_LOW_ANGLE,
+    FEATURE_SNAP_ITER_HIGH_ANGLE,
+    FEATURE_ANGLE_LOW_THRESHOLD,
+    FEATURE_ANGLE_HIGH_THRESHOLD,
+    WALL_PATCH_NAMES,
+    WALL_PATCH_DEFAULT,
+    SOLVER_MODES,
+    STL_UNIT_DETECTION_FACTOR,
+    STL_MM_TO_M_CONVERSION
+)
+from .geometry_utils import (
+    read_stl_triangles,
+    find_internal_seed_point,
+    detect_stl_units
+)
 
 @dataclass
 class Stage1Targets:
@@ -67,7 +95,7 @@ class Stage1MeshOptimizer:
         # Iteration state
         self.current_iteration = 0
         # Check STAGE1 section first, then root level, then default
-        self.max_iterations = int(self.stage1.get("max_iterations", self.config.get("max_iterations", 4)))
+        self.max_iterations = int(self.stage1.get("max_iterations", self.config.get("max_iterations", MAX_ITERATIONS_DEFAULT)))
         self.logger.debug(f"Max iterations: {self.max_iterations} (from {'STAGE1' if 'max_iterations' in self.stage1 else 'root' if 'max_iterations' in self.config else 'default'})")
         self.surface_levels = list(_safe_get(self.config, ["SNAPPY", "surface_level"], [1, 1]))
 
@@ -250,24 +278,24 @@ class Stage1MeshOptimizer:
         layers = self.config.get("LAYERS", {})
                 
         # Ensure first layer thickness is reasonable for vascular scale
-        first_layer = layers.get("firstLayerThickness_abs", 50e-6)
-        if first_layer is not None and (first_layer < 10e-6 or first_layer > 200e-6):
-            recommended = 50e-6  # 50 microns - good for most vascular flows
+        first_layer = layers.get("firstLayerThickness_abs", FIRST_LAYER_DEFAULT)
+        if first_layer is not None and (first_layer < FIRST_LAYER_MIN or first_layer > FIRST_LAYER_MAX):
+            recommended = FIRST_LAYER_DEFAULT
             self.logger.info(f"Adjusting first layer thickness: {first_layer*1e6:.1f}μm → {recommended*1e6:.1f}μm")
             layers["firstLayerThickness_abs"] = recommended
             
         # Ensure feature angle detection is in proven range
         snap = self.config.get("SNAPPY", {})
-        resolve_angle = snap.get("resolveFeatureAngle", 35)
-        if resolve_angle < 25 or resolve_angle > 60:
-            recommended = 35  # Conservative but effective
+        resolve_angle = snap.get("resolveFeatureAngle", FEATURE_ANGLE_DEFAULT)
+        if resolve_angle < FEATURE_ANGLE_MIN or resolve_angle > FEATURE_ANGLE_MAX:
+            recommended = FEATURE_ANGLE_RECOMMENDED
             self.logger.info(f"Adjusting resolveFeatureAngle: {resolve_angle}° → {recommended}°")
             snap["resolveFeatureAngle"] = recommended
             
         # Ensure sufficient snap iterations for complex geometry
-        n_feature_snap = snap.get("nFeatureSnapIter", 20)
+        n_feature_snap = snap.get("nFeatureSnapIter", FEATURE_SNAP_ITER_HIGH_ANGLE)
         if n_feature_snap < 10:
-            recommended = 20  # Proven to work well for vascular geometry  
+            recommended = FEATURE_SNAP_ITER_HIGH_ANGLE
             self.logger.info(f"Increasing nFeatureSnapIter: {n_feature_snap} → {recommended}")
             snap["nFeatureSnapIter"] = recommended
             
@@ -399,14 +427,13 @@ class Stage1MeshOptimizer:
     
     def _discover_wall_name(self) -> str:
         """Discover wall patch name generically across vascular beds"""
-        candidate_names = ["wall_aorta", "wall", "vessel_wall", "arterial_wall"]
-        for name in candidate_names:
+        for name in WALL_PATCH_NAMES:
             if (self.geometry_dir / f"{name}.stl").exists():
                 self.logger.info(f"Wall patch discovered: {name}")
                 return name
         # Fallback to default
-        self.logger.warning("No standard wall patch found, using 'wall_aorta'")
-        return "wall_aorta"
+        self.logger.warning(f"No standard wall patch found, using '{WALL_PATCH_DEFAULT}'")
+        return WALL_PATCH_DEFAULT
 
     def _estimate_reference_diameters(self, stl_root=None) -> Tuple[float, float]:
         """Return (D_ref, D_min) in METERS - vessel-agnostic approach.
@@ -477,19 +504,19 @@ class Stage1MeshOptimizer:
                             stem_name = p.name.replace('.stl', '')
                             self.logger.debug(f"Outlet {stem_name} (scaled): area={area:.6f} m²")
                         else:
-                            # For original STLs, apply unit detection logic
-                            # Robust unit guess using the outlet's bbox  
+                            # For original STLs, apply improved unit detection
                             ob = gen.compute_stl_bounding_box({p.stem: p})
-                            # Plausible m² upper bound from bbox (conservative)
-                            lx, ly, lz = self._get_bbox_dimensions(ob)
-                            A_plausible = max(1e-10, lx * ly)
-                            # If reported 'area' is > 1000× plausible, assume mm² → convert to m²
-                            if area > 1000.0 * A_plausible:
+                            bbox_dims = np.array(self._get_bbox_dimensions(ob))
+                            
+                            # Use improved unit detection function
+                            detected_units = detect_stl_units(area, bbox_dims, self.logger)
+                            
+                            if detected_units == 'mm':
                                 area_mm2 = area
-                                area /= 1e6
+                                area = area * STL_MM_TO_M_CONVERSION
                                 self.logger.info(f"Outlet {p.stem}: detected mm² units ({area_mm2:.1f} mm²) → converted to {area:.6f} m²")
                             else:
-                                self.logger.debug(f"Outlet {p.stem}: area={area:.6f} m² (units look correct)")
+                                self.logger.debug(f"Outlet {p.stem}: area={area:.6f} m² (units confirmed as meters)")
                         
                         Deq_outlet = 2.0 * math.sqrt(area / math.pi)
                         Deq.append(Deq_outlet)
@@ -549,7 +576,7 @@ class Stage1MeshOptimizer:
             min_realistic_diameter = 0.2e-3  # 0.2 mm in meters
             for i, d in enumerate(Deq):
                 if d < min_realistic_diameter:
-                    self.logger.warning(f"⚠️ Equivalent diameter D_eq[{i}]={d*1e3:.3f}mm < 0.2mm - likely a scaling issue or degenerate outlet!")
+                    self.logger.warning(f"Equivalent diameter D_eq[{i}]={d*1e3:.3f}mm < 0.2mm - likely a scaling issue or degenerate outlet!")
                     self.logger.warning(f"   Check your STL units or outlet geometry. Common causes:")
                     self.logger.warning(f"   - STL file in wrong units (m vs mm)")
                     self.logger.warning(f"   - Outlet patch is collapsed or has near-zero area")
@@ -675,180 +702,45 @@ class Stage1MeshOptimizer:
         Returns:
             np.ndarray shape (3,) point inside lumen (meters)
         """
-        import numpy as _np
-
-        # ---------- locate triSurface paths ----------
-        # Accept either the full self.stl_files dict or a minimal dict with just inlet
+        # Locate triSurface paths
         if "required" in stl_files and "inlet" in stl_files["required"]:
             inlet_path = Path(stl_files["required"]["inlet"])
-            tri_root = inlet_path.parent
-            wall_path = tri_root / f"{self.wall_name}.stl"
-            outlet_paths = sorted(tri_root.glob("outlet*.stl"))
         else:
-            inlet_path = self.stl_files["required"]["inlet"]
-            tri_root = inlet_path.parent
-            wall_path = self.stl_files["required"][self.wall_name]
-            outlet_paths = list(self.stl_files["outlets"])
-
-        if not wall_path.exists():
-            raise FileNotFoundError(f"Wall STL not found at {wall_path}")
+            # Fallback for different dict structure
+            inlet_path = stl_files.get("inlet", self.stl_files["required"]["inlet"])
+            if not isinstance(inlet_path, Path):
+                inlet_path = Path(inlet_path)
+        
+        # Ensure inlet exists
         if not inlet_path.exists():
             raise FileNotFoundError(f"Inlet STL not found at {inlet_path}")
-        if not outlet_paths:
-            self.logger.warning("No outlet STLs found while building closed surface; inside-test may fail.")
-
-        # ---------- helpers: triangles + inside test ----------
-        def _triangles_from(paths):
-            tris = []
-            for p in paths:
-                for _, v1, v2, v3 in self._iter_stl_triangles(p):
-                    tris.append((_np.array(v1, dtype=float),
-                                 _np.array(v2, dtype=float),
-                                 _np.array(v3, dtype=float)))
-            if not tris:
-                raise RuntimeError(f"No triangles found in {', '.join(str(x) for x in paths)}")
-            return tris
-
-        def _ray_triangle_intersect(orig, direc, v0, v1, v2, eps):
-            # Möller–Trumbore
-            e1 = v1 - v0
-            e2 = v2 - v0
-            pvec = _np.cross(direc, e2)
-            det = e1.dot(pvec)
-            if abs(det) < eps:
-                return False, None
-            inv_det = 1.0 / det
-            tvec = orig - v0
-            u = tvec.dot(pvec) * inv_det
-            if u < -eps or u > 1.0 + eps:
-                return False, None
-            qvec = _np.cross(tvec, e1)
-            v = direc.dot(qvec) * inv_det
-            if v < -eps or u + v > 1.0 + eps:
-                return False, None
-            t = e2.dot(qvec) * inv_det
-            if t > eps:  # forward hit
-                return True, t
-            return False, None
-
-        def _point_on_triangle(pt, v0, v1, v2, eps):
-            # barycentric check
-            n = _np.cross(v1 - v0, v2 - v0)
-            area2 = _np.linalg.norm(n)
-            if area2 < eps:
-                return False
-            n = n / area2
-            dist = abs((pt - v0).dot(n))
-            if dist > eps:
-                return False
-            # 2D barycentric via areas
-            def _area(a, b, c):
-                return _np.linalg.norm(_np.cross(b - a, c - a)) * 0.5
-            A = _area(v0, v1, v2)
-            A0 = _area(pt, v1, v2)
-            A1 = _area(v0, pt, v2)
-            A2 = _area(v0, v1, pt)
-            return abs((A0 + A1 + A2) - A) <= 10*eps
-
-        def _is_inside_closed_surface(pt, tris, eps, ray_dir=_np.array([0.57735, 0.70711, 0.40825])):
-            # treat "on surface" as inside
-            for v0, v1, v2 in tris[:256]:  # quick local check on a subset
-                if _point_on_triangle(pt, v0, v1, v2, eps):
-                    return True
-            # ray parity
-            o = pt + ray_dir * (100*eps)  # nudge off the surface
-            cnt = 0
-            for v0, v1, v2 in tris:
-                hit, _ = _ray_triangle_intersect(o, ray_dir, v0, v1, v2, eps)
-                if hit:
-                    cnt += 1
-            return (cnt % 2) == 1
-
-        # ---------- build closed surface ----------
-        tris = _triangles_from([wall_path, inlet_path, *outlet_paths])
-
-        # characteristic scale & eps
-        Lx = float(bbox_data["mesh_domain"]["x_max"] - bbox_data["mesh_domain"]["x_min"])
-        Ly = float(bbox_data["mesh_domain"]["y_max"] - bbox_data["mesh_domain"]["y_min"])
-        Lz = float(bbox_data["mesh_domain"]["z_max"] - bbox_data["mesh_domain"]["z_min"])
-        Lchar = max(1e-3, min(Lx, Ly, Lz))
-        eps = 1e-9 * max(Lx, Ly, Lz)
-
-        step = max(2.0*(dx_base or 1e-3), 5e-4)             # 2 Δx or 0.5 mm
-        max_run = max(0.3*Lchar, 15.0*step)                 # up to ~30% of min bbox edge
-        n_steps = int(max_run/step) + 2
-
-        # ---------- inlet centroid & normal (from inlet vertices PCA) ----------
-        inlet_vertices = _np.array(self._read_stl_vertices_raw(inlet_path), dtype=float)
-        if inlet_vertices.size == 0:
-            raise RuntimeError("Failed to read inlet vertices for seed computation.")
-        C = inlet_vertices.mean(axis=0)
-
-        # PCA: smallest singular vector is plane normal
-        _, _, Vt = _np.linalg.svd(inlet_vertices - C, full_matrices=False)
-        n = Vt[-1, :]
-        n = n / (_np.linalg.norm(n) or 1.0)
-
-        # Prefer direction pointing toward global bbox center
-        bbox_center = _np.array([
+        
+        # Read inlet triangles using new utility function
+        inlet_triangles = read_stl_triangles(inlet_path)
+        
+        # Extract bbox dimensions
+        bbox_size = np.array([
+            bbox_data["mesh_domain"]["x_max"] - bbox_data["mesh_domain"]["x_min"],
+            bbox_data["mesh_domain"]["y_max"] - bbox_data["mesh_domain"]["y_min"],
+            bbox_data["mesh_domain"]["z_max"] - bbox_data["mesh_domain"]["z_min"]
+        ])
+        
+        bbox_center = np.array([
             (bbox_data["mesh_domain"]["x_min"] + bbox_data["mesh_domain"]["x_max"]) * 0.5,
             (bbox_data["mesh_domain"]["y_min"] + bbox_data["mesh_domain"]["y_max"]) * 0.5,
-            (bbox_data["mesh_domain"]["z_min"] + bbox_data["mesh_domain"]["z_max"]) * 0.5,
+            (bbox_data["mesh_domain"]["z_min"] + bbox_data["mesh_domain"]["z_max"]) * 0.5
         ])
-        if (bbox_center - C).dot(n) < 0.0:
-            n = -n
-
-        # ---------- candidate search: +n, then -n, then towards center, then jitter ----------
-        def _scan_from(origin, direction):
-            d = step
-            for _ in range(n_steps):
-                pt = origin + direction * d
-                if _is_inside_closed_surface(pt, tris, eps):
-                    return pt
-                d += step
-            return None
-
-        # 1) march along +n from inlet centroid
-        p = _scan_from(C, n)
-        if p is not None:
-            self.logger.info(f"Seed found: inlet +n at {p}")
-            return p
-
-        # 2) march along -n
-        p = _scan_from(C, -n)
-        if p is not None:
-            self.logger.info(f"Seed found: inlet -n at {p}")
-            return p
-
-        # 3) march from inlet toward bbox center
-        v = bbox_center - C
-        v = v / (_np.linalg.norm(v) or 1.0)
-        p = _scan_from(C, v)
-        if p is not None:
-            self.logger.info(f"Seed found: inlet → center at {p}")
-            return p
-
-        # 4) sample along centerline segment (0.3..0.8 toward center)
-        for a in _np.linspace(0.3, 0.8, 11):
-            pt = (1.0 - a)*C + a*bbox_center
-            if _is_inside_closed_surface(pt, tris, eps):
-                self.logger.info(f"Seed found: convex combo {a:.2f} at {pt}")
-                return pt
-
-        # 5) last resort: jitter near bbox center
-        rng = _np.random.RandomState(42)
-        for _ in range(200):
-            jitter = rng.normal(0.0, step, 3)
-            pt = bbox_center + jitter
-            if _is_inside_closed_surface(pt, tris, eps):
-                self.logger.info(f"Seed found: center+jitter at {pt}")
-                return pt
-
-        # If we get here, something is wrong with the surface set (likely not closed)
-        raise RuntimeError(
-            "Could not find a locationInMesh inside the closed surface. "
-            "Check that wall+inlet+outlet STLs form a watertight enclosure."
+        
+        # Use the new find_internal_seed_point function
+        seed_point = find_internal_seed_point(
+            bbox_center, 
+            bbox_size, 
+            inlet_triangles,
+            dx_base,
+            self.logger
         )
+        
+        return seed_point
 
     # ------------------------ Curvature analysis helpers -------------------------
     def _iter_stl_triangles(self, stl_path: Path):
@@ -1486,7 +1378,12 @@ includedAngle   {included_angle:.1f};  // curvature-adaptive feature detection
         (iter_dir / "system" / "surfaceFeaturesDict").write_text(content)
 
     def _calculate_refinement_bands(self, dx_base):
-        """Calculate near and far refinement band distances"""
+        """
+        Calculate near and far refinement band distances with adaptive scaling.
+        
+        Key insight: When surface refinement increases, surface cells get smaller by 2^level,
+        so we need to widen the bands proportionally to maintain proper cell coverage.
+        """
         if self.physics.get("use_womersley_bands", False):
             # Physics-aware bands based on Womersley boundary layer thickness
             D_ref, _ = self._estimate_reference_diameters()
@@ -1506,15 +1403,84 @@ includedAngle   {included_angle:.1f};  // curvature-adaptive feature detection
             
             self.logger.info(f"Womersley boundary layers: δ_W={delta_w*1e6:.1f}μm, near={near_dist*1e6:.1f}μm, far={far_dist*1e6:.1f}μm")
         else:
-            # Geometry-based bands using configured cell multiples
-            near_cells = self.stage1.get("near_band_cells", 4)
-            far_cells = self.stage1.get("far_band_cells", 10)
-            near_dist = near_cells * dx_base
-            far_dist = far_cells * dx_base
+            # Geometry-based bands with adaptive scaling for surface refinement
+            near_dist, far_dist = self._calculate_adaptive_refinement_bands(dx_base)
+            
+        return near_dist, far_dist
+
+    def _calculate_adaptive_refinement_bands(self, dx_base):
+        """
+        Calculate refinement bands that adapt to surface refinement level.
+        
+        Maintains proper prism-friendly zone coverage as surface cells get smaller.
+        Original: near=4Δx, far=10Δx  
+        Improved: near=6-8Δx, far=12-16Δx (scaled by refinement level)
+        """
+        # Get current maximum surface refinement level
+        current_max_level = self._get_current_surface_refinement_level()
+        
+        # Base cell counts (improved from original 4/10 to 6-8/12-16 range)  
+        base_near_cells = self.stage1.get("near_band_cells", 4)
+        base_far_cells = self.stage1.get("far_band_cells", 10)
+        
+        # Apply improved baseline (6-8 for near, 12-16 for far)
+        if base_near_cells == 4:  # Original default
+            improved_near_cells = 7  # Middle of 6-8 range
+        else:
+            improved_near_cells = max(6, base_near_cells)  # Ensure at least 6
+            
+        if base_far_cells == 10:  # Original default  
+            improved_far_cells = 14  # Middle of 12-16 range
+        else:
+            improved_far_cells = max(12, base_far_cells)  # Ensure at least 12
+        
+        # Scale bands based on surface refinement level
+        # Surface cells get smaller by factor 2^(level-1), so widen bands accordingly
+        if current_max_level > 1:
+            refinement_factor = 2 ** (current_max_level - 1)
+            
+            # Progressive scaling: modest increase for level 2, more for higher levels
+            if current_max_level == 2:
+                # Level 2: Surface cells are 2x smaller, increase bands by 1.5x
+                band_scale_factor = 1.5
+            elif current_max_level == 3:
+                # Level 3: Surface cells are 4x smaller, increase bands by 2.0x  
+                band_scale_factor = 2.0
+            else:
+                # Level ≥4: Surface cells are ≥8x smaller, increase bands by 2.5x
+                band_scale_factor = 2.5
+                
+            scaled_near_cells = improved_near_cells * band_scale_factor
+            scaled_far_cells = improved_far_cells * band_scale_factor
+            
+            self.logger.info(f"ADAPTIVE BAND SCALING for surface level {current_max_level}")
+            self.logger.info(f"   Refinement factor: {refinement_factor}x smaller surface cells")
+            self.logger.info(f"   Band scale factor: {band_scale_factor}x")
+            self.logger.info(f"   Near band: {improved_near_cells} → {scaled_near_cells:.1f} cells")
+            self.logger.info(f"   Far band: {improved_far_cells} → {scaled_far_cells:.1f} cells")
+            
+        else:
+            # Level 1: Use improved baseline without additional scaling
+            scaled_near_cells = improved_near_cells
+            scaled_far_cells = improved_far_cells
+            
+            if base_near_cells == 4 or base_far_cells == 10:
+                self.logger.info(f"📏 IMPROVED BAND SIZING (level 1)")
+                self.logger.info(f"   Near band: {base_near_cells} → {scaled_near_cells:.1f} cells (6-8Δx range)")  
+                self.logger.info(f"   Far band: {base_far_cells} → {scaled_far_cells:.1f} cells (12-16Δx range)")
+        
+        # Calculate distances
+        near_dist = scaled_near_cells * dx_base  
+        far_dist = scaled_far_cells * dx_base
+        
         return near_dist, far_dist
 
     def _snappy_no_layers_dict(self, iter_dir, outlet_names, internal_pt, dx_base):
         snap = self.config["SNAPPY"]
+        
+        # Compute Δx-aware mergeTolerance to avoid over-merging at throats
+        merge_tol = float(min(1e-5, 0.05 * dx_base))
+        merge_tol = max(1e-6, merge_tol)  # cap at reasonable bounds
         
         # Calculate refinement band distances
         near_dist, far_dist = self._calculate_refinement_bands(dx_base)
@@ -1564,6 +1530,7 @@ castellatedMeshControls
             file "inlet.eMesh";
             level {self.surface_levels[0]};
         }}
+{chr(10).join(f'        {{ file "{n}.eMesh"; level {self.surface_levels[0]}; }}' for n in outlet_names)}
     );
     
     refinementSurfaces
@@ -1654,8 +1621,8 @@ meshQualityControls
     relaxed
     {{
         maxNonOrtho 75;
-        maxBoundarySkewness 6.0;
-        maxInternalSkewness 6.0;
+        maxBoundarySkewness 12.0;
+        maxInternalSkewness 12.0;
         maxConcave 90;
         minFlatness 0.3;
         minVol 1e-15;
@@ -1666,11 +1633,18 @@ meshQualityControls
     }}
 }}
 
-mergeTolerance 1e-6;
+mergeTolerance {merge_tol:.1e};
 """
         (iter_dir / "system" / "snappyHexMeshDict.noLayer").write_text(content)
 
     def _snappy_layers_dict(self, iter_dir, outlet_names, internal_pt, dx_base):
+        # Apply consistent minThickness policy before generating layer dict
+        self._apply_consistent_minThickness_policy()
+        
+        # Compute Δx-aware mergeTolerance to avoid over-merging at throats
+        merge_tol = float(min(1e-5, 0.05 * dx_base))
+        merge_tol = max(1e-6, merge_tol)  # cap at reasonable bounds
+        
         L = self.config["LAYERS"].copy()  # Make a copy to avoid modifying config
         
         # Calculate refinement bands for layer thickness validation
@@ -1723,9 +1697,27 @@ mergeTolerance 1e-6;
         
         if min_thickness > first_layer * 0.2:  # minThickness should be ≤ 20% of firstLayer
             old_min = min_thickness
-            L["minThickness_abs"] = max(first_layer * 0.15, 1e-6)  # 15% of first layer, floor at 1µm
-            self.logger.warning(f"FIXED minThickness constraint: {old_min*1e6:.1f}μm → {L['minThickness_abs']*1e6:.1f}μm "
-                              f"(15% of firstLayer with 1µm floor)")
+            # Use consistent minThickness policy instead of hardcoded 15% rule
+            self._apply_consistent_minThickness_policy()
+            L["minThickness_abs"] = self.config["LAYERS"]["minThickness_abs"]
+            self.logger.warning(f"FIXED minThickness constraint using consistent policy: {old_min*1e6:.1f}μm → {L['minThickness_abs']*1e6:.1f}μm")
+        
+        # Determine if using relative or absolute sizing
+        is_rel = bool(L.get("relativeSizes", False))
+        
+        # Generate the correct thickness lines based on sizing mode
+        if is_rel:
+            first_layer_line = f"firstLayerThickness {L.get('firstLayerThickness', 0.20):.3f};"
+            final_layer_line = f"finalLayerThickness {L.get('finalLayerThickness', 0.75):.3f};" if L.get('finalLayerThickness') else ""
+            min_thick_line = f"minThickness {L.get('minThickness', max(0.18, min(0.25, L.get('firstLayerThickness', 0.2) * 0.75))):.3f};"
+        else:
+            first_layer_line = f"firstLayerThickness {L.get('firstLayerThickness_abs', 50e-6):.2e};"
+            final_layer_line = ""  # not used in absolute mode
+            min_thick_line = f"minThickness {L.get('minThickness_abs', 2e-6):.2e};"
+        
+        # Get consistent memory limits from SNAPPY config (fix inconsistency with snap phase)
+        mlc = self.config["SNAPPY"].get("maxLocalCells", 2000000)
+        mgc = self.config["SNAPPY"].get("maxGlobalCells", 8000000)
         
         # Sync effective layer parameters back to config for metrics consistency
         self.config["LAYERS"].update({
@@ -1766,8 +1758,8 @@ geometry
 
 castellatedMeshControls
 {{
-    maxLocalCells 100000;
-    maxGlobalCells 2000000;
+    maxLocalCells {mlc};
+    maxGlobalCells {mgc};
     minRefinementCells 0;
     maxLoadUnbalance 0.10;
     nCellsBetweenLevels 1;
@@ -1791,7 +1783,7 @@ snapControls
 addLayersControls
 {{
     relativeSizes {str(L.get("relativeSizes", False)).lower()};
-    {f'finalLayerThickness {L.get("finalLayerThickness", 0.7):.2f};' if L.get("relativeSizes", False) else ''}
+    {final_layer_line}
     layers
     {{
         "{self.wall_name}"
@@ -1800,9 +1792,9 @@ addLayersControls
         }}
     }}
 
-    firstLayerThickness {L.get("firstLayerThickness_abs", 50e-6):.2e};
+    {first_layer_line}
     expansionRatio {L["expansionRatio"]};
-    minThickness {L.get("minThickness_abs", 20e-6):.2e};
+    {min_thick_line}
     nGrow {L.get("nGrow", 0)};
     featureAngle {min(L.get("featureAngle",60), 90)};
     nRelaxIter {L.get("nRelaxIter", 5)};
@@ -1840,8 +1832,8 @@ meshQualityControls
     relaxed
     {{
         maxNonOrtho 75;
-        maxBoundarySkewness 6.0;
-        maxInternalSkewness 6.0;
+        maxBoundarySkewness 12.0;
+        maxInternalSkewness 12.0;
         maxConcave 90;
         minFlatness 0.3;
         minVol 1e-15;
@@ -1852,7 +1844,7 @@ meshQualityControls
     }}
 }}
 
-mergeTolerance 1e-6;
+mergeTolerance {merge_tol:.1e};
 """
         (iter_dir / "system" / "snappyHexMeshDict.layers").write_text(content)
 
@@ -1993,8 +1985,20 @@ method          scotch;
             try:
                 res = run_command(cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
                 (logs / log_name).write_text(res.stdout + res.stderr)
+                
+                # Check for critical failure indicators
+                output_text = res.stdout + res.stderr
+                if "FOAM FATAL ERROR" in output_text or "Aborted" in output_text:
+                    error_msg = f"Critical error in {cmd[0]}: Check {log_name} for details"
+                    self.logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+                    
             except Exception as e:
                 self.logger.error(f"Command failed: {' '.join(cmd)} | {e}")
+                # Return error state immediately for critical preprocessing failures
+                if cmd[0] in ["blockMesh", "surfaceFeatures"]:
+                    error_metrics = {"meshOK": False, "cells": 0, "error": str(e)}
+                    return error_metrics, error_metrics, error_metrics
         
         # Domain decomposition for parallel run
         if pre:
@@ -2020,9 +2024,23 @@ method          scotch;
         self.logger.info(f"Running: {' '.join(snappy_cmd)} (mesh without layers)")
         try:
             res = run_command(snappy_cmd, cwd=iter_dir, env_setup=env, timeout=None, max_memory_gb=self.max_memory_gb)
-            (logs / "log.snappy.no_layers").write_text(res.stdout + res.stderr)
+            output_text = res.stdout + res.stderr
+            (logs / "log.snappy.no_layers").write_text(output_text)
+            
+            # Check for common snappyHexMesh failure patterns
+            if any(pattern in output_text for pattern in [
+                "FOAM FATAL ERROR", "Aborted", "Could not find cellZone", 
+                "locationInMesh", "No cells in mesh", "Maximum number of cells"
+            ]):
+                error_msg = "snappyHexMesh failed with critical error - check log.snappy.no_layers"
+                self.logger.error(error_msg)
+                # Continue with error state but don't fail immediately - allow recovery
+                
         except Exception as e:
             self.logger.error(f"Mesh generation (no layers) failed: {e}")
+            # Return failed state but continue to try layer addition
+            error_metrics = {"meshOK": False, "cells": 0, "error": f"snappyHexMesh error: {str(e)}"}
+            return error_metrics, error_metrics, {"coverage_overall": 0.0, "error": str(e)}
         
         # Basic mesh generation validation using boundary file fallback
         mesh_generation_ok = False
@@ -2118,7 +2136,7 @@ method          scotch;
             self.logger.error(f"Layer meshing failed: {e}")
         
         # Parse layer coverage from snappyHexMesh log
-        layer_cov = parse_layer_coverage(iter_dir, env, wall_name=self.wall_name)
+        layer_cov = parse_physics_aware_coverage(iter_dir, env, wall_name=self.wall_name)
         
         # Enhanced convergence tracking
         layer_log = logs / "log.snappy.layers"
@@ -2257,7 +2275,8 @@ method          scotch;
             current_first = self.config["LAYERS"].get("firstLayerThickness_abs", 50e-6)
             if current_first > 10e-6:  # Don't go below 10 microns
                 self.config["LAYERS"]["firstLayerThickness_abs"] = current_first * 0.7
-                self.config["LAYERS"]["minThickness_abs"] = max(self.config["LAYERS"]["firstLayerThickness_abs"] * 0.15, 1e-6)
+                # Apply consistent minThickness policy after reducing first layer
+                self._apply_consistent_minThickness_policy()
                 self.logger.info(f"Reduced first layer: {current_first*1e6:.1f}→{self.config['LAYERS']['firstLayerThickness_abs']*1e6:.1f}μm for better coverage")
             
             # 2. Increase smoothing iterations for better layer normals
@@ -2269,16 +2288,18 @@ method          scotch;
                 self.config["LAYERS"]["slipFeatureAngle"] = 45
                 self.logger.info("Enabled slipFeatureAngle=45° for sharp corner handling")
             
-            # 4. Consider relativeSizes for complex geometries (if very poor coverage)
+            # 4. Switch to relativeSizes when surfaces are refined (CRITICAL for stability)
+            self._apply_relative_sizing_for_refinement(coverage)
+            
+            # 5. Consider relativeSizes for complex geometries (if very poor coverage)
             if coverage < 0.4 and not self.config["LAYERS"].get("relativeSizes", False):
                 self.config["LAYERS"]["relativeSizes"] = True
                 self.config["LAYERS"]["finalLayerThickness"] = 0.7  # 70% of base cell size
                 self.logger.info("Switched to relativeSizes=true for complex geometry adaptation")
             
             # 5. Relax quality controls that prevent layer addition
-            # Ensure minThickness follows the documented rule: max(0.15·t1, 1µm)
-            current_first = self.config["LAYERS"].get("firstLayerThickness_abs", 50e-6)
-            self.config["LAYERS"]["minThickness_abs"] = max(current_first * 0.15, 1e-6)
+            # Apply consistent minThickness policy
+            self._apply_consistent_minThickness_policy()
             self.config["LAYERS"]["nRelaxedIter"] = max(self.config["LAYERS"].get("nRelaxedIter", 10), 20)
             
             self.logger.info(f"Improved layer strategy: first={self.config['LAYERS']['firstLayerThickness_abs']*1e6:.1f}μm, "
@@ -2299,8 +2320,8 @@ method          scotch;
             # 2. Only if still failing, reduce first layer but keep minThickness constraint
             if coverage < 0.3:  # Very poor coverage, reduce thickness
                 self.config["LAYERS"]["firstLayerThickness_abs"] *= 0.8
-                # CRITICAL: Maintain minThickness = 15% of firstLayer with 1µm floor
-                self.config["LAYERS"]["minThickness_abs"] = max(self.config["LAYERS"]["firstLayerThickness_abs"] * 0.15, 1e-6)
+                # Apply consistent minThickness policy after reducing firstLayer
+                self._apply_consistent_minThickness_policy()
             
             # 3. Make expansion ratio adaptive - smaller ER helps extrusion when layers hurt quality
             if self.config["LAYERS"].get("expansionRatio", 1.2) > 1.15:
@@ -2320,36 +2341,313 @@ method          scotch;
                            f"medialRatio={self.config['LAYERS']['maxThicknessToMedialRatio']:.2f}, "
                            f"first={self.config['LAYERS']['firstLayerThickness_abs']*1e6:.1f}μm, "
                            f"min={self.config['LAYERS']['minThickness_abs']*1e6:.1f}μm, nGrow={self.config['LAYERS']['nGrow']}")
-            return
+        
+        # Apply complex curvature controls based on coverage
+        area_weighted_coverage = layer_cov.get("coverage_area_weighted", coverage)
+        self._apply_complex_curvature_controls(area_weighted_coverage)
+        
+        return
 
-        # If snap already poor: reduce only the MAX wall level; keep MIN to preserve adjacency
-        if NO > self.targets.max_nonortho or SK > self.targets.max_skewness:
-            if self.surface_levels[1] > self.surface_levels[0]:
-                self.surface_levels[1] -= 1
-                self.logger.info(f"Reduced surface level max → {self.surface_levels}")
+    def _apply_relative_sizing_for_refinement(self, coverage: float) -> None:
+        """
+        CRITICAL: Switch to relative thickness when surface refinement increases.
+        
+        Key insight: When ladder goes up (finer surface mesh), absolute layer thickness
+        becomes too large relative to surface cell size, causing extrusion failures.
+        
+        Solution: Use relativeSizes=true with proper T_rel and t1_rel ratios.
+        """
+        # Check if we have surface levels to evaluate refinement
+        if not hasattr(self, 'surface_levels') or self.surface_levels is None:
+            return
+            
+        current_max_level = max(self.surface_levels)
+        
+        # Switch to relative sizing when surface refinement increases beyond level 1
+        if current_max_level > 1 and not self.config["LAYERS"].get("relativeSizes", False):
+            self.config["LAYERS"]["relativeSizes"] = True
+            
+            # Apply optimal relative thickness ratios based on your specifications:
+            # t1/Δx_surf ≈ 0.18–0.25 (first layer thickness relative to surface cell size)  
+            # T/Δx_surf ≈ 0.6–0.9 (total thickness relative to surface cell size)
+            # ER = 1.12–1.18 (expansion ratio)
+            
+            # Conservative values for stability
+            t1_rel = 0.20  # t1/Δx_surf = 0.20 (middle of 0.18-0.25 range)
+            T_rel = 0.75   # T/Δx_surf = 0.75 (middle of 0.6-0.9 range)
+            ER = 1.15      # Expansion ratio = 1.15 (middle of 1.12-1.18 range)
+            
+            self.config["LAYERS"]["firstLayerThickness"] = t1_rel
+            self.config["LAYERS"]["finalLayerThickness"] = T_rel  
+            self.config["LAYERS"]["expansionRatio"] = ER
+            
+            # Remove absolute sizing parameters when using relative
+            if "firstLayerThickness_abs" in self.config["LAYERS"]:
+                del self.config["LAYERS"]["firstLayerThickness_abs"]
+            if "minThickness_abs" in self.config["LAYERS"]:
+                del self.config["LAYERS"]["minThickness_abs"]
+                
+            self.logger.info(f"SWITCHED TO RELATIVE SIZING for surface level {current_max_level}")
+            self.logger.info(f"   t1_rel={t1_rel} (t1/Δx_surf), T_rel={T_rel} (T/Δx_surf), ER={ER}")
+            
+        elif current_max_level > 1 and self.config["LAYERS"].get("relativeSizes", False):
+            # Already using relative sizing - adjust ratios based on coverage performance
+            current_t1_rel = self.config["LAYERS"].get("firstLayerThickness", 0.2)
+            
+            if coverage < 0.3:
+                # Very poor coverage - reduce first layer relative thickness
+                new_t1_rel = max(0.15, current_t1_rel * 0.85)  # Reduce but stay above 0.15 minimum
+                self.config["LAYERS"]["firstLayerThickness"] = new_t1_rel
+                self.logger.info(f"   Reduced t1_rel: {current_t1_rel:.3f} → {new_t1_rel:.3f} for better coverage")
+                
+            elif coverage < 0.5 and current_t1_rel > 0.18:
+                # Poor coverage - slight reduction
+                new_t1_rel = max(0.18, current_t1_rel * 0.9)
+                self.config["LAYERS"]["firstLayerThickness"] = new_t1_rel
+                self.logger.info(f"   Adjusted t1_rel: {current_t1_rel:.3f} → {new_t1_rel:.3f}")
+                
+        # For uniform meshes (level 1 only), keep absolute sizing
+        elif current_max_level == 1 and self.config["LAYERS"].get("relativeSizes", False):
+            # Switch back to absolute for uniform meshes if coverage is good
+            if coverage > 0.6:
+                self.config["LAYERS"]["relativeSizes"] = False
+                
+                # Restore reasonable absolute values
+                self.config["LAYERS"]["firstLayerThickness_abs"] = 50e-6  # 50 microns
+                # Apply consistent minThickness policy instead of hardcoded value
+                self._apply_consistent_minThickness_policy()
+                
+                # Remove relative parameters
+                if "firstLayerThickness" in self.config["LAYERS"]:
+                    del self.config["LAYERS"]["firstLayerThickness"] 
+                if "finalLayerThickness" in self.config["LAYERS"]:
+                    del self.config["LAYERS"]["finalLayerThickness"]
+                    
+                self.logger.info("🔄 Switched back to ABSOLUTE sizing for uniform mesh (level 1)")
+                
+    def _get_current_surface_refinement_level(self) -> int:
+        """Get the maximum surface refinement level from current ladder step"""
+        if hasattr(self, 'surface_levels') and self.surface_levels:
+            return max(self.surface_levels)
+        return 1  # Default to level 1
+
+    def _apply_relative_sizing_on_ladder_progression(self) -> None:
+        """
+        Apply relative sizing proactively when ladder progression increases surface refinement.
+        
+        This is called whenever surface_levels change due to ladder progression.
+        Key principle: Switch to relativeSizes=true BEFORE layers fail.
+        """
+        if not hasattr(self, 'surface_levels') or self.surface_levels is None:
+            return
+            
+        current_max_level = max(self.surface_levels)
+        
+        # Proactively switch to relative sizing when moving beyond level 1
+        if current_max_level > 1:
+            if not self.config["LAYERS"].get("relativeSizes", False):
+                self.config["LAYERS"]["relativeSizes"] = True
+                
+                # Apply conservative relative thickness ratios for stability
+                # Based on your specifications: t1/Δx_surf ≈ 0.18–0.25, T/Δx_surf ≈ 0.6–0.9, ER = 1.12–1.18
+                
+                # Start conservatively for higher surface levels
+                if current_max_level >= 3:
+                    t1_rel = 0.18  # Lower end for high refinement
+                    T_rel = 0.65   
+                    ER = 1.12      
+                elif current_max_level == 2:
+                    t1_rel = 0.22  # Middle range
+                    T_rel = 0.75
+                    ER = 1.15
+                else:  # level > 1 but < 2 (e.g., mixed levels like [1,2])
+                    t1_rel = 0.25  # Higher end for moderate refinement  
+                    T_rel = 0.85
+                    ER = 1.18
+                
+                self.config["LAYERS"]["firstLayerThickness"] = t1_rel
+                self.config["LAYERS"]["finalLayerThickness"] = T_rel  
+                self.config["LAYERS"]["expansionRatio"] = ER
+                
+                # Remove absolute sizing parameters
+                if "firstLayerThickness_abs" in self.config["LAYERS"]:
+                    del self.config["LAYERS"]["firstLayerThickness_abs"]
+                if "minThickness_abs" in self.config["LAYERS"]:
+                    del self.config["LAYERS"]["minThickness_abs"]
+                    
+                self.logger.info(f"PROACTIVE RELATIVE SIZING for ladder progression to level {current_max_level}")
+                self.logger.info(f"   Applied ratios: t1_rel={t1_rel}, T_rel={T_rel}, ER={ER}")
+                self.logger.info(f"   This prevents layer extrusion failures on refined surfaces")
+                
             else:
-                # increase angle (toward 60) to chase fewer features
-                self.config["SNAPPY"]["resolveFeatureAngle"] = min(60, int(self.config["SNAPPY"].get("resolveFeatureAngle",45)) + int(self.stage1.get("featureAngle_step",10)))
-                self.logger.info(f"Raised resolveFeatureAngle → {self.config['SNAPPY']['resolveFeatureAngle']}°")
-            return
-
-        # If quality ok but features washed out (coverage ok and deltas small): allow MORE feature snap
-        if coverage >= self.targets.min_layer_cov and dNO < 2 and dSK < 0.2:
-            # decrease angle (toward 30) to capture more curvature
-            self.config["SNAPPY"]["resolveFeatureAngle"] = max(30, int(self.config["SNAPPY"].get("resolveFeatureAngle",45)) - int(self.stage1.get("featureAngle_step",10)))
-            self.logger.info(f"Lowered resolveFeatureAngle → {self.config['SNAPPY']['resolveFeatureAngle']}°")
-            return
-
-
-        # FOLLOW THE RULE: Only add layers when coverage is GOOD (>70%), quality is good
-        if coverage >= self.targets.min_layer_cov and NO < self.targets.max_nonortho * 0.8 and SK < self.targets.max_skewness * 0.8:
-            # NOW it's safe to add layers gradually
-            if current_layers < 12:  # Conservative maximum
-                self.config["LAYERS"]["nSurfaceLayers"] = min(current_layers + 1, 12)  # Add 1 at a time
-                self.logger.info(f"✅ Good coverage ({coverage*100:.1f}%), added layer: {current_layers}→{self.config['LAYERS']['nSurfaceLayers']}")
-        elif coverage < self.targets.min_layer_cov:
-            # Poor coverage: DON'T add layers, that makes it worse
-            self.logger.warning(f"❌ Poor coverage ({coverage*100:.1f}%) - NOT adding layers (would make coverage worse)")
+                # Already using relative sizing - adjust for new surface level
+                current_t1_rel = self.config["LAYERS"].get("firstLayerThickness", 0.2)
+                
+                # Make ratios more conservative for higher refinement levels
+                if current_max_level >= 3 and current_t1_rel > 0.20:
+                    new_t1_rel = 0.18  # Conservative for high refinement
+                    new_T_rel = 0.65
+                    new_ER = 1.12
+                    
+                    self.config["LAYERS"]["firstLayerThickness"] = new_t1_rel
+                    self.config["LAYERS"]["finalLayerThickness"] = new_T_rel
+                    self.config["LAYERS"]["expansionRatio"] = new_ER
+                    
+                    self.logger.info(f"Adjusted relative sizing for high refinement level {current_max_level}")
+                    self.logger.info(f"   t1_rel: {current_t1_rel:.3f} → {new_t1_rel}, T_rel: → {new_T_rel}, ER: → {new_ER}")
+                    
+        else:
+            # Surface level is 1 - can use absolute sizing for uniformity
+            if self.config["LAYERS"].get("relativeSizes", False):
+                self.logger.info("Surface level 1: keeping relative sizing (if already enabled)")
+                # Don't switch back automatically - let coverage-based logic handle it
+    
+    def _apply_consistent_minThickness_policy(self) -> None:
+        """
+        Apply consistent minThickness scaling policy across both relative and absolute sizing modes.
+        
+        Policy options (as requested):
+        1. relativeSizes=true: minThickness_rel ≈ 0.18–0.25 (same ballpark as t1_rel)
+        2. absoluteSizing: scale-aware absolute values:
+           - Fine scale (≤1mm): 1–2 μm for small vessels  
+           - Coarse scale (≥10mm): 2–5 μm for adult aorta
+           
+        This ensures users aren't surprised by inconsistent minThickness behavior.
+        """
+        is_relative_mode = self.config["LAYERS"].get("relativeSizes", False)
+        
+        if is_relative_mode:
+            # Relative mode: minThickness_rel ≈ 0.18–0.25 (same ballpark as t1_rel)
+            t1_rel = self.config["LAYERS"].get("firstLayerThickness", 0.2)
+            
+            # Use slightly smaller minThickness_rel than t1_rel for stability
+            # Target: minThickness_rel = 0.75 * t1_rel, clamped to 0.18–0.25 range
+            min_thickness_rel = max(0.18, min(0.25, t1_rel * 0.75))
+            
+            self.config["LAYERS"]["minThickness"] = min_thickness_rel
+            
+            # Remove absolute minThickness if present
+            if "minThickness_abs" in self.config["LAYERS"]:
+                del self.config["LAYERS"]["minThickness_abs"]
+                
+            self.logger.info(f"Applied relative minThickness policy: {min_thickness_rel:.3f} "
+                           f"(based on t1_rel={t1_rel:.3f})")
+            
+        else:
+            # Absolute mode: geometry-aware absolute values (drive from dx or D_ref, not scale_m)
+            # Get a representative size from actual mesh/geometry, not conversion factor
+            try:
+                D_ref, D_min = self._estimate_reference_diameters()
+                dx = self._derive_base_cell_size(D_ref, D_min)
+            except Exception:
+                dx = 3e-4  # safe middle fallback (300 μm)
+            
+            # Pick minThickness floors based on actual mesh size (tunable parameters)
+            if dx <= 2e-4:          # Fine meshes (≤200μm): coronaries/small pediatrics
+                min_thickness_abs = 1.0e-6  # 1 μm
+            elif dx >= 1e-3:        # Coarse meshes (≥1mm): adult aorta
+                min_thickness_abs = 3.0e-6  # 3 μm
+            else:
+                # Linear interpolate 1–3 μm based on actual mesh size
+                t = (dx - 2e-4) / (1e-3 - 2e-4)  # normalize to [0,1]
+                min_thickness_abs = 1.0e-6 + t * (3.0e-6 - 1.0e-6)
+                
+            self.config["LAYERS"]["minThickness_abs"] = min_thickness_abs
+            
+            # Remove relative minThickness if present  
+            if "minThickness" in self.config["LAYERS"]:
+                del self.config["LAYERS"]["minThickness"]
+                
+            self.logger.info(f"Applied geometry-aware minThickness policy: {min_thickness_abs*1e6:.1f}μm "
+                           f"(based on dx={dx*1e6:.0f}μm)")
+    
+    def _check_coverage_gated_progression(self, proposed_surface_levels, previous_coverage_data=None) -> Tuple[List[int], bool]:
+        """
+        Gate progression on coverage ≥ 70% and median layers ≥ n-1.
+        You'll move forward less often, but never by sacrificing boundary-layer quality.
+        
+        Args:
+            proposed_surface_levels: Proposed new surface refinement levels from ladder
+            previous_coverage_data: Coverage metrics from previous iteration
+            
+        Returns:
+            (actual_surface_levels, progression_allowed): Final levels to use and whether progression was allowed
+        """
+        if previous_coverage_data is None:
+            # No previous data - allow initial progression
+            return proposed_surface_levels, True
+            
+        # Extract physics-aware metrics 
+        area_weighted_coverage = previous_coverage_data.get("coverage_area_weighted", 0.0)
+        median_layers = previous_coverage_data.get("median_layers", 0.0)
+        target_layers = self.config["LAYERS"].get("nSurfaceLayers", 6)
+        
+        # Coverage gating criteria: coverage ≥ 70% and median layers ≥ n-1
+        coverage_ok = area_weighted_coverage >= 0.70
+        layers_ok = median_layers >= (target_layers - 1)
+        
+        current_levels = getattr(self, 'surface_levels', [1, 1])
+        max_current = max(current_levels)
+        max_proposed = max(proposed_surface_levels)
+        
+        progression_requested = max_proposed > max_current
+        
+        if progression_requested:
+            if coverage_ok and layers_ok:
+                # Allow progression - quality criteria met
+                self.logger.info(f"COVERAGE GATED PROGRESSION: ALLOWED")
+                self.logger.info(f"   Coverage: {area_weighted_coverage*100:.1f}% >= 70% OK")
+                self.logger.info(f"   Median layers: {median_layers:.1f} >= {target_layers-1} OK") 
+                self.logger.info(f"   Surface levels: {current_levels} → {proposed_surface_levels}")
+                return proposed_surface_levels, True
+            else:
+                # Block progression - quality criteria not met
+                self.logger.warning(f"COVERAGE GATED PROGRESSION: BLOCKED")
+                self.logger.warning(f"   Coverage: {area_weighted_coverage*100:.1f}% {'OK' if coverage_ok else 'FAIL'} (need >=70%)")
+                self.logger.warning(f"   Median layers: {median_layers:.1f} {'OK' if layers_ok else 'FAIL'} (need >={target_layers-1})")
+                self.logger.warning(f"   Keeping current surface levels: {current_levels} (blocked {proposed_surface_levels})")
+                self.logger.warning(f"   Focus on improving boundary layer quality before surface refinement")
+                return current_levels, False
+        else:
+            # No progression requested - allow (maintaining or reducing levels)
+            return proposed_surface_levels, True
+    
+    def _apply_complex_curvature_controls(self, coverage: float) -> None:
+        """
+        Apply distance-to-medial and angle controls for complex curvature.
+        
+        For complex curvature, use:
+        - maxThicknessToMedialRatio ≈ 0.45–0.6
+        - minMedianAxisAngle ≈ 60–70°  
+        - featureAngle (layers) ≈ 70–80°
+        
+        Raise these only when coverage is <40% after a retry with ER/t1 fixes.
+        """
+        current_medial_ratio = self.config["LAYERS"].get("maxThicknessToMedialRatio", 0.3)
+        current_axis_angle = self.config["LAYERS"].get("minMedianAxisAngle", 90)
+        current_feature_angle = self.config["LAYERS"].get("featureAngle", 60)
+        
+        if coverage < 0.40:
+            # Poor coverage - apply complex curvature settings
+            target_medial_ratio = min(0.60, max(0.45, current_medial_ratio + 0.05))
+            target_axis_angle = max(60, min(70, current_axis_angle - 5))  
+            target_feature_angle = min(80, max(70, current_feature_angle + 5))
+            
+            self.config["LAYERS"]["maxThicknessToMedialRatio"] = target_medial_ratio
+            self.config["LAYERS"]["minMedianAxisAngle"] = target_axis_angle
+            self.config["LAYERS"]["featureAngle"] = target_feature_angle
+            
+            self.logger.info(f"Applied complex curvature controls for coverage {coverage*100:.1f}%")
+            self.logger.info(f"   maxThicknessToMedialRatio: {current_medial_ratio:.2f} → {target_medial_ratio:.2f}")
+            self.logger.info(f"   minMedianAxisAngle: {current_axis_angle}° → {target_axis_angle}°")  
+            self.logger.info(f"   featureAngle: {current_feature_angle}° → {target_feature_angle}°")
+            
+        elif coverage >= 0.60:
+            # Good coverage - can use more conservative settings
+            if current_medial_ratio > 0.35:
+                target_medial_ratio = 0.35  # More conservative for stable mesh
+                self.config["LAYERS"]["maxThicknessToMedialRatio"] = target_medial_ratio
+                self.logger.info(f"Reset to conservative medial ratio: {current_medial_ratio:.2f} → {target_medial_ratio:.2f}")
 
     # ------------------------------- Loop ---------------------------------
     def iterate_until_quality(self):
@@ -2359,6 +2657,7 @@ method          scotch;
 
         best_iter = None
         best_cell_count = math.inf
+        previous_coverage_data = None  # Track coverage for gated progression
         summary_path = self.output_dir / "stage1_summary.csv"
         if not summary_path.exists():
             with open(summary_path, "w", newline="") as f:
@@ -2416,17 +2715,30 @@ method          scotch;
             # Apply ladder progression per iteration (before writing snappy dicts)
             ladder = self.stage1.get("ladder", [[1,1],[2,2],[2,3]])
             idx = min(self.current_iteration-1, len(ladder)-1)
-            new_surface_levels = list(ladder[idx])
+            proposed_surface_levels = list(ladder[idx])
+            
+            # COVERAGE GATED PROGRESSION: Check if progression should be allowed
+            if self.stage1.get("use_coverage_gated_progression", True):
+                actual_surface_levels, progression_allowed = self._check_coverage_gated_progression(
+                    proposed_surface_levels, previous_coverage_data)
+            else:
+                actual_surface_levels, progression_allowed = proposed_surface_levels, True
             
             # Detect if surface levels changed - if so, need full remesh
             surface_levels_changed = (not hasattr(self, 'surface_levels') or 
-                                    self.surface_levels != new_surface_levels)
+                                    self.surface_levels != actual_surface_levels)
             
-            self.surface_levels = new_surface_levels
-            self.logger.info(f"Surface levels from ladder: {self.surface_levels}")
+            self.surface_levels = actual_surface_levels
+            self.logger.info(f"Surface levels from ladder: {proposed_surface_levels} → {self.surface_levels}")
+            if not progression_allowed:
+                self.logger.info(f"   (progression blocked by coverage gating)")
             
             if surface_levels_changed:
                 self.logger.info("Surface refinement levels changed - full remesh required")
+                # CRITICAL: Apply relative sizing when surface refinement increases
+                self._apply_relative_sizing_on_ladder_progression()
+                # Apply consistent minThickness policy after sizing mode changes
+                self._apply_consistent_minThickness_policy()
             else:
                 self.logger.info("Surface levels unchanged - could optimize for layers-only")
             
@@ -2439,13 +2751,17 @@ method          scotch;
             )
             
             # Calculate and apply dynamic nFeatureSnapIter before generating snappy dicts
-            current_feature_angle = int(self.config["SNAPPY"].get("resolveFeatureAngle", 45))
-            if current_feature_angle <= 35:
-                current_nFeatureSnapIter = 30
-            elif current_feature_angle >= 55:
-                current_nFeatureSnapIter = 20
+            current_feature_angle = int(self.config["SNAPPY"].get("resolveFeatureAngle", FEATURE_ANGLE_DEFAULT))
+            if current_feature_angle <= FEATURE_ANGLE_LOW_THRESHOLD:
+                current_nFeatureSnapIter = FEATURE_SNAP_ITER_LOW_ANGLE
+            elif current_feature_angle >= FEATURE_ANGLE_HIGH_THRESHOLD:
+                current_nFeatureSnapIter = FEATURE_SNAP_ITER_HIGH_ANGLE
             else:
-                current_nFeatureSnapIter = int(30 + (20 - 30) * (current_feature_angle - 35) / (55 - 35))
+                # Linear interpolation between thresholds
+                current_nFeatureSnapIter = int(FEATURE_SNAP_ITER_LOW_ANGLE + 
+                    (FEATURE_SNAP_ITER_HIGH_ANGLE - FEATURE_SNAP_ITER_LOW_ANGLE) * 
+                    (current_feature_angle - FEATURE_ANGLE_LOW_THRESHOLD) / 
+                    (FEATURE_ANGLE_HIGH_THRESHOLD - FEATURE_ANGLE_LOW_THRESHOLD))
             
             # Apply the calculated nFeatureSnapIter to config so it's used in snappy dicts
             self.config["SNAPPY"]["nFeatureSnapIter"] = current_nFeatureSnapIter
@@ -2455,9 +2771,78 @@ method          scotch;
             self._snappy_dict(iter_dir, outlet_names, internal_point, dx, "layers")
             self._surface_check(iter_dir)
 
-            # Run mesh generation
-            snap_m, layer_m, layer_cov = self._run_snap_then_layers(iter_dir, force_full_remesh=surface_levels_changed)
-
+            # Run mesh generation with micro-loop for layer parameter back-offs
+            K = MICRO_TRIALS_PER_ITERATION
+            best_local = None
+            
+            for trial in range(1, K+1):
+                self.logger.info(f"Micro-trial {trial}/{K} for iteration {k}")
+                
+                snap_m, layer_m, layer_cov = self._run_snap_then_layers(
+                    iter_dir, 
+                    force_full_remesh=(trial == 1 and surface_levels_changed)
+                )
+                
+                # Evaluate trial quality
+                constraints_ok, failure_reasons = self._meets_quality_constraints(snap_m, layer_m, layer_cov)
+                coverage = layer_cov.get('coverage_overall', 0.0)
+                
+                # Track best trial by coverage
+                if best_local is None or coverage > best_local[2].get('coverage_overall', 0):
+                    best_local = (snap_m, layer_m, layer_cov)
+                    self.logger.info(f"Trial {trial}: coverage={coverage*100:.1f}% (new best)")
+                else:
+                    self.logger.info(f"Trial {trial}: coverage={coverage*100:.1f}% (not better)")
+                
+                # Stop if we have good quality or acceptable coverage
+                if constraints_ok or coverage >= COVERAGE_ACCEPTABLE_THRESHOLD:
+                    self.logger.info(f"Stopping micro-loop: {'constraints OK' if constraints_ok else f'coverage ≥{COVERAGE_ACCEPTABLE_THRESHOLD*100:.0f}%'}")
+                    break
+                
+                # Quick parameter back-offs for next trial (no re-castellation)
+                if trial < K:
+                    self.logger.info(f"Applying quick back-offs for trial {trial+1}")
+                    
+                    # Apply relative sizing if not already enabled
+                    self._apply_relative_sizing_for_refinement(coverage)
+                    
+                    # Reduce expansion ratio slightly
+                    if self.config["LAYERS"].get("expansionRatio", 1.2) > 1.12:
+                        old_er = self.config["LAYERS"]["expansionRatio"]
+                        self.config["LAYERS"]["expansionRatio"] = max(1.12, old_er - 0.02)
+                        self.logger.info(f"  Reduced expansionRatio: {old_er:.3f} → {self.config['LAYERS']['expansionRatio']:.3f}")
+                    
+                    # Reduce first layer thickness (relative or absolute)
+                    if self.config["LAYERS"].get("relativeSizes", False):
+                        old_t1 = self.config["LAYERS"].get("firstLayerThickness", 0.2)
+                        new_t1 = max(0.15, 0.9 * old_t1)
+                        self.config["LAYERS"]["firstLayerThickness"] = new_t1
+                        self.logger.info(f"  Reduced relative t1: {old_t1:.3f} → {new_t1:.3f}")
+                    else:
+                        old_t1 = self.config["LAYERS"].get("firstLayerThickness_abs", 50e-6)
+                        new_t1 = max(10e-6, 0.8 * old_t1)
+                        self.config["LAYERS"]["firstLayerThickness_abs"] = new_t1
+                        self.logger.info(f"  Reduced absolute t1: {old_t1*1e6:.1f}μm → {new_t1*1e6:.1f}μm")
+                    
+                    # Update minThickness policy after first layer changes
+                    self._apply_consistent_minThickness_policy()
+            
+            # Use the best trial results for subsequent processing
+            snap_m, layer_m, layer_cov = best_local
+            self.logger.info(f"Using best trial with coverage={layer_cov.get('coverage_overall', 0)*100:.1f}%")
+            
+            # Log surface histogram to identify thickness/cell size issues
+            if hasattr(self, 'surface_levels'):
+                t1_thickness = self.config["LAYERS"].get("firstLayerThickness_abs", 50e-6)
+                n_layers = self.config["LAYERS"].get("nSurfaceLayers", 6)
+                expansion = self.config["LAYERS"].get("expansionRatio", 1.2)
+                total_thickness = t1_thickness * (expansion**n_layers - 1) / (expansion - 1) if expansion != 1.0 else t1_thickness * n_layers
+                
+                log_surface_histogram(iter_dir, self.surface_levels, dx, t1_thickness, total_thickness, self.logger)
+            
+            # Update coverage data for next iteration's gating
+            previous_coverage_data = layer_cov
+            
             # Objective
             # Check quality constraints and get cell count
             constraints_ok, failure_reasons = self._meets_quality_constraints(snap_m, layer_m, layer_cov)
@@ -2509,6 +2894,15 @@ method          scotch;
             (iter_dir / "stage1_metrics.json").write_text(json.dumps(metrics, indent=2))
 
             # Append CSV summary (before plateau check to ensure final iteration is always logged)
+            # Generate accurate CSV values based on sizing mode
+            L = self.config["LAYERS"]
+            if L.get("relativeSizes", False):
+                t1_out = f"{L.get('firstLayerThickness', 0.2):.3f}rel"
+                min_out = f"{L.get('minThickness', 0.15):.3f}rel"
+            else:
+                t1_out = f"{L.get('firstLayerThickness_abs', 50e-6):.3e}"
+                min_out = f"{L.get('minThickness_abs', 2e-6):.3e}"
+            
             with open(summary_path, "a", newline="") as f:
                 csv.writer(f).writerow([
                     k,
@@ -2520,8 +2914,8 @@ method          scotch;
                     self.surface_levels[0], self.surface_levels[1],
                     int(self.config["SNAPPY"].get("resolveFeatureAngle",45)),
                     self.config["LAYERS"]["nSurfaceLayers"],
-                    f"{self.config['LAYERS'].get('firstLayerThickness_abs', 50e-6):.3e}",
-                    f"{self.config['LAYERS'].get('minThickness_abs', 20e-6):.3e}",
+                    t1_out,
+                    min_out,
                 ])
 
             # Constraint-based acceptance: minimize cells subject to quality constraints
@@ -2547,7 +2941,7 @@ method          scotch;
             self._apply_updates(snap_m, layer_m, layer_cov)
 
         if best_iter is None:
-            self.logger.warning("⚠️ Stage-1 did not meet all quality constraints within max_iterations")
+            self.logger.warning("Stage-1 did not meet all quality constraints within max_iterations")
             best_iter = iter_dir
             final_status = "INCOMPLETE"
         else:
@@ -2572,10 +2966,10 @@ method          scotch;
                 with open(best_metrics_path) as f:
                     best_metrics = json.load(f)
                 best_cells = best_metrics.get("cell_count", 0)
-                self.logger.info(f"🎯 Stage-1 {final_status}: Best geometry-based mesh has {best_cells:,} cells")
+                self.logger.info(f"Stage-1 {final_status}: Best geometry-based mesh has {best_cells:,} cells")
         
-        self.logger.info(f"📁 Best Stage-1 mesh exported to: {best_out}")
-        self.logger.info(f"🚀 Ready for Stage-2 physics verification (GCI analysis)")
+        self.logger.info(f"Best Stage-1 mesh exported to: {best_out}")
+        self.logger.info(f"Ready for Stage-2 physics verification (GCI analysis)")
         
         return best_out
 

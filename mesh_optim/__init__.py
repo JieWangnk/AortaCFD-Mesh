@@ -11,7 +11,7 @@ Tutorial 1: Learn automated mesh generation for complex vascular geometries.
 """
 
 from .stage1_mesh import Stage1MeshOptimizer
-from .utils import run_command, check_mesh_quality, parse_layer_coverage
+from .legacy_functions import run_command, check_mesh_quality, parse_layer_coverage
 
 __version__ = "1.0.0-tutorial1"
 __all__ = ["Stage1MeshOptimizer", "run_command", "check_mesh_quality", "parse_layer_coverage"]

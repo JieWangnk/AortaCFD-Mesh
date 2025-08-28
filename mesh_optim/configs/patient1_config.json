@@ -1,90 +1,103 @@
 {
-  "description": "Optimized config for patient1 case - fine scale multi-branch aorta, scale 0.001m (1mm units). Features automatic relative sizing and adaptive band scaling that maintain layer coverage as surface refinement increases.",
-  
+  "description": "Stage-1 optimized config for patient1: relative layers + band override + micro-loop. Units: STL in mm → scale 0.001 m.",
   "openfoam_env_path": "source /opt/openfoam12/etc/bashrc",
-  
+
   "mesh": {
     "base_size_mode": "diameter",
-    "cells_per_diameter": 8,
-    "min_cells_per_throat": 4
+    "cells_per_diameter": 12,
+    "min_cells_per_throat": 16
   },
-  "SCALING": {
-    "scale_m": 0.001
-  },
+
+  "SCALING": { "scale_m": 0.001 },
 
   "refinement": {
     "surface_levels": [1, 1],
     "near_band_dx": 7,
     "far_band_dx": 14,
-    "feature_angle": {
-      "init": 35,
-      "step": 10
-    }
+    "feature_angle": { "mode": "adaptive", "init": 32, "step": 10 }
   },
-  
+
   "layers": {
-    "n": 6,
+    "n": 5,
     "expansion": 1.15,
+    "relativeSizes": true,
+    "minThickness": 0.15,
     "first_layer": {
-      "t_over_dx": 1,
-      "t1_min_frac": 0.01,
-      "t1_max_frac": 0.2
+      "mode": "relative",
+      "t1_rel": 0.20,
+      "T_rel": 0.75
     }
   },
-  
+
   "physics": {
-    "flow_model": "laminar",
-    "y_plus": 1,
-    "U_peak": 0.5,
+    "solver_mode": "RANS",
+    "flow_model": "turbulent",
+    "y_plus": 30,
+    "U_peak": 0.6,
     "rho": 1060.0,
-    "mu": 0.004,
+    "mu": 0.0035,
     "use_womersley_bands": true,
     "heart_rate_hz": 1.25
   },
-  
+
   "accept": {
-    "maxNonOrtho": 80,
+    "maxNonOrtho": 75,
     "maxSkewness": 4.5,
-    "min_layer_coverage": 0.50
+    "min_layer_coverage": 0.60
   },
-  
+
   "compute": {
-    "procs": 4,
+    "procs": 1,
     "cell_budget_kb_per_cell": 1.5
   },
-  
+
   "iterations": {
     "max": 5,
-    "ladder": [[1,1], [1,1], [1,1], [1,2], [1,2]],
-    "use_robust_optimization": true,
-    "use_coverage_gated_progression": true
+    "ladder": [[1,1],[1,1],[1,2],[1,2],[2,2]],
+    "use_coverage_gated_progression": true,
+    "micro_layer_retries": 3
   },
-  
+
   "advanced": {
     "BLOCKMESH": {
-      "resolution": 100,
+      "resolution": 120,
       "grading": [1, 1, 1]
     },
-    
     "SNAPPY": {
-      "maxLocalCells": 15000000,
-      "maxGlobalCells": 60000000,
-      "nCellsBetweenLevels": 2,
-      "resolveFeatureAngle": 50,
-      "nSmoothPatch": 5,
-      "nFeatureSnapIter": 12,
-      "implicitFeatureSnap": true,
-      "explicitFeatureSnap": false
+      "nCellsBetweenLevels": 1,
+      "resolveFeatureAngle": 32,
+      "nSmoothPatch": 3,
+      "implicitFeatureSnap": false,
+      "explicitFeatureSnap": true
     },
-    
     "LAYERS": {
-      "nSurfaceLayers": 6,
-      "minThickness_abs": 1.0e-8,
-      "expansionRatio": 1.3,
-      "nGrow": 2,
+      "nSurfaceLayers": 5,
+      "nGrow": 0,
       "featureAngle": 70,
-      "maxThicknessToMedialRatio": 0.2,
-      "minMedianAxisAngle": 95
+      "maxThicknessToMedialRatio": 0.45,
+      "minMedianAxisAngle": 70,
+      "nSmoothSurfaceNormals": 5,
+      "nRelaxIter": 6,
+      "nLayerIter": 60,
+      "nRelaxedIter": 20,
+      "slipFeatureAngle": 45
+    }
+  },
+
+  "SURFACE_FEATURES": {
+    "includedAngle": 160
+  },
+
+  "STAGE1": {
+    "use_coverage_gated_progression": true,
+    "autoFirstLayerFromDx": true,
+    "alpha_total_layers": 0.75,
+    "t1_min_fraction_of_dx": 0.02,
+    "t1_max_fraction_of_dx": 0.08,
+    "band_override": {
+      "enabled": true,
+      "near_cells": 10,
+      "far_cells": 22
     }
   }
 }
