@@ -1,17 +1,14 @@
 """
-AortaCFD Stage 1 Mesh Optimization Package
+AortaCFD Stage 1 Mesh Generation Package V2
 
-Automated geometry-driven mesh generation for vascular CFD:
-- Physics-aware boundary layer generation
-- Adaptive surface refinement
-- Quality-constrained optimization
-- OpenFOAM snappyHexMesh automation
-
-Tutorial 1: Learn automated mesh generation for complex vascular geometries.
+Clean, simplified single-pass mesh generation for vascular CFD:
+- Ray-casting interior point detection
+- Single-pass snappyHexMesh execution
+- No optimization loops or complex orchestration
+- JSON-based configuration
 """
 
 from .stage1_mesh import Stage1MeshOptimizer
-from .legacy_functions import run_command, check_mesh_quality, parse_layer_coverage
 
-__version__ = "1.0.0-tutorial1"
-__all__ = ["Stage1MeshOptimizer", "run_command", "check_mesh_quality", "parse_layer_coverage"]
+__version__ = "2.0.0-clean"
+__all__ = ["Stage1MeshOptimizer"]

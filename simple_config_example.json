@@ -1,0 +1,51 @@
+{
+  "description": "Simplified mesh configuration - no optimization loops",
+  
+  "openfoam_env_path": "source /opt/openfoam12/etc/bashrc",
+  
+  "SCALING": { 
+    "scale_m": 0.001 
+  },
+  
+  "mesh": {
+    "base_size_mode": "diameter",
+    "cells_per_diameter": 20,
+    "min_cells_per_throat": 25
+  },
+  
+  "refinement": {
+    "surface_levels": [1, 2],
+    "feature_angle": {
+      "init": 40
+    }
+  },
+  
+  "layers": {
+    "n": 4,
+    "expansion": 1.2,
+    "relativeSizes": true,
+    "minThickness": 0.10,
+    "first_layer": {
+      "mode": "relative",
+      "t1_rel": 0.50
+    }
+  },
+  
+  "advanced": {
+    "BLOCKMESH": {
+      "resolution": 100
+    },
+    "SNAPPY": {
+      "maxGlobalCells": 2000000,
+      "maxLocalCells": 1000000,
+      "nCellsBetweenLevels": 3,
+      "resolveFeatureAngle": 40,
+      "tolerance": 2.0,
+      "nSolveIter": 30,
+      "nRelaxIter": 5,
+      "nFeatureSnapIter": 10,
+      "implicitFeatureSnap": false,
+      "explicitFeatureSnap": true
+    }
+  }
+}
